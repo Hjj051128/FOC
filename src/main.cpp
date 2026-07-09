@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include "DengFOC.h"
 
-int Sensor_DIR = 1;    // 传感器方向
+int Sensor_DIR = -1;    // 传感器方向
 int Motor_PP = 7;       // 电机极对数
 int EN = 7;             // 定义使能引脚
 
