@@ -1,75 +1,114 @@
 #include <Arduino.h>
 #include "DengFOC.h"
 
-int Sensor_DIR = -1;    // 传感器方向
-int Motor_PP = 7;       // 电机极对数
-int EN = 7;             // 定义使能引脚
+// X axis is the axis you have already tuned.
+#define ANGKP_X       2.3f
+#define ANGKI_X       0.01f
+#define ANGKD_X       0.0f
 
-float target;
-float angle;
-float velocity;
-float error;
+#define SPEEDKP_X     0.006f
+#define SPEEDKI_X     0.0f
+#define SPEEDKD_X     0.0f
 
-// 定义一个定时器指针
+// Y axis parameters are reserved here. Do not enable Y until the hardware is ready.
+#define ANGKP_Y       2.3f
+#define ANGKI_Y       0.01f
+#define ANGKD_Y       0.0f
+
+#define SPEEDKP_Y     0.006f
+#define SPEEDKI_Y     0.0f
+#define SPEEDKD_Y     0.0f
+
+int Sensor_DIR_X = -1;
+int Motor_PP_X = 7;
+int EN_X = 7;
+
+int Sensor_DIR_Y = -1;
+int Motor_PP_Y = 7;
+int EN_Y = 13;
+
+float targetX = 0.0f;
+float angleX = 0.0f;
+float velocityX = 0.0f;
+float errorX = 0.0f;
+
+float targetY = 0.0f;
+float angleY = 0.0f;
+float velocityY = 0.0f;
+float errorY = 0.0f;
+
 hw_timer_t *debug_timer = NULL;
 volatile bool print_flag = false;
 
 void onDebugTimer();
 
-void setup() {
-  // 初始化使能引脚高电平
-  pinMode(EN, OUTPUT);
-  digitalWrite(EN, HIGH);
+void setup()
+{
+  pinMode(EN_X, OUTPUT);
+  digitalWrite(EN_X, HIGH);
 
-  // 初始化串口波特率
+  // Y enable pin is reserved now. Keep it LOW so the second driver will not move yet.
+  pinMode(EN_Y, OUTPUT);
+  digitalWrite(EN_Y, LOW);
+
   Serial.begin(115200);
 
-  //设定驱动器供电电压
-  DFOC_Vbus(12.0);  
-  
-  // 对齐电角度零点
-  DFOC_alignSensor(Motor_PP,Sensor_DIR);
+  // Only initialize and run X now. This keeps your tuned behavior unchanged.
+  DFOC_X_Vbus(12.0f);
+  DFOC_X_alignSensor(Motor_PP_X, Sensor_DIR_X);
+  DFOC_X_SET_ANGLE_PID(ANGKP_X, ANGKI_X, ANGKD_X, 100000);
+  DFOC_X_SET_VEL_PID(SPEEDKP_X, SPEEDKI_X, SPEEDKD_X, 0);
 
-  // 位置环PID
-  // 有误差改I P也可以，P可以增加力
+  // Later, when testing Y alone, enable these lines:
+  // digitalWrite(EN_Y, HIGH);
+  // DFOC_Y_Vbus(12.0f);
+  // DFOC_Y_alignSensor(Motor_PP_Y, Sensor_DIR_Y);
+  // DFOC_Y_SET_ANGLE_PID(ANGKP_Y, ANGKI_Y, ANGKD_Y, 100000);
+  // DFOC_Y_SET_VEL_PID(SPEEDKP_Y, SPEEDKI_Y, SPEEDKD_Y, 0);
 
-  DFOC_M0_SET_ANGLE_PID(2.3, 0.01, 0.0, 100000);
-
-  // 设置速度环PID 最后一个参数是变化速率限制，越小，输出变化越慢更柔；越大，几乎不限制
-  // 增大P可以提速，但是可能过冲
-  DFOC_M0_SET_VEL_PID(0.006,0.00,0,0);
-
-  // 创建定时器设置频率
   debug_timer = timerBegin(1000000);
-  timerAttachInterrupt(debug_timer, &onDebugTimer);  // 绑定中断函数
-  timerAlarm(debug_timer, 20000, true, 0);   // 设置闹钟无限重复
+  timerAttachInterrupt(debug_timer, &onDebugTimer);
+  timerAlarm(debug_timer, 20000, true, 0);
 }
 
-void loop() 
+void loop()
 {
-  // 接收串口，接收的数据送入全局变量_motor_target
   serialReceiveUserCommand();
 
-  // 设置目标角度
-  // 位置 + 速度串级控制
-  DFOC_M0_set_Velocity_Angle(serial_motor_target());
+  targetX = serial_motor_target();
+  DFOC_X_set_Velocity_Angle(targetX);
 
-  // 串口打印数据部分
-  if(print_flag) {
+  // Y is not controlled yet. Keep this disabled until Y hardware and direction are tested.
+  // targetY = 0.0f;
+  // DFOC_Y_set_Velocity_Angle(targetY);
+
+  if (print_flag) {
     print_flag = false;
-    // 这些变量不应该放在中断函数里面。因为会改变FOC状态
-    target = serial_motor_target(); // 目标角度
-    angle = DFOC_M0_Angle();        // 获取当前角度
-    velocity = DFOC_M0_Velocity();  // 获取当前速度
-    error = target - angle;         // 误差：目标减去实际
-    Serial.print(velocity);
+
+    angleX = DFOC_X_Angle();
+    velocityX = DFOC_X_Velocity();
+    errorX = targetX - angleX;
+
+    Serial.print(velocityX);
     Serial.print(",");
-    Serial.print(angle);
+    Serial.print(angleX);
     Serial.print(",");
-    Serial.println(error);
+    Serial.println(errorX);
+
+    // Later VOFA output for dual axis can be:
+    // angleY = DFOC_Y_Angle();
+    // velocityY = DFOC_Y_Velocity();
+    // errorY = targetY - angleY;
+    // Serial.print(velocityX); Serial.print(",");
+    // Serial.print(angleX); Serial.print(",");
+    // Serial.print(errorX); Serial.print(",");
+    // Serial.print(velocityY); Serial.print(",");
+    // Serial.print(angleY); Serial.print(",");
+    // Serial.println(errorY);
   }
 }
 
-void onDebugTimer() {
+void onDebugTimer()
+{
   print_flag = true;
 }
