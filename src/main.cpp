@@ -19,6 +19,15 @@
 #define SPEEDKI_Y     0.0f
 #define SPEEDKD_Y     0.0f
 
+
+// 电机方向极性
+#define SENSOR_DIR_X  -1
+#define SENSOR_DIR_Y  -1
+
+// 电机极对数
+#define MOTOR_PP_X    7
+#define MOTOR_PP_Y    7
+
 // 限位
 #define X_ANGLE_MIN  -1.5f
 #define X_ANGLE_MAX  1.5f
@@ -30,12 +39,18 @@
 #define COMMAND_TIMEOUT_MS  500
 
 
-int Sensor_DIR_X = -1;
-int Motor_PP_X = 7;
-int EN_X = 7;
+// 视觉跟踪参数
+#define VISION_KX            0.002f  // x轴像素误差转换到速度的比例
+#define VISION_KY            0.002f  // y轴像素误差转换到速度的比例
+#define MAX_TRACK_SPEED_X    0.6f    // x轴跟踪最大速度
+#define MAX_TRACK_SPEED_Y    0.6f    // y轴跟踪最大速度
+#define VISION_DEAD_ZONE     5.0f    // 中心死区像素
+#define VISION_DIR_X         1.0     // X轴视觉误差方向
+#define VISION_DIR_Y         1.0     // Y轴视觉误差方向
 
-int Sensor_DIR_Y = -1;
-int Motor_PP_Y = 7;
+
+// 电机引脚
+int EN_X = 7;
 int EN_Y = 13;
 
 float targetX = 0.0f;
@@ -70,7 +85,7 @@ void setup()
 
   // 初始化X电机电压
   DFOC_X_Vbus(12.0f);
-  DFOC_X_alignSensor(Motor_PP_X, Sensor_DIR_X);
+  DFOC_X_alignSensor(MOTOR_PP_X, SENSOR_DIR_X);
 
   // X角度环PID
   DFOC_X_SET_ANGLE_PID(ANGKP_X, ANGKI_X, ANGKD_X, 100000);
@@ -81,7 +96,7 @@ void setup()
   // 使能Y电机
   digitalWrite(EN_Y, HIGH);
   DFOC_Y_Vbus(12.0f);
-  DFOC_Y_alignSensor(Motor_PP_Y, Sensor_DIR_Y);
+  DFOC_Y_alignSensor(MOTOR_PP_Y, SENSOR_DIR_Y);
   DFOC_Y_SET_ANGLE_PID(ANGKP_Y, ANGKI_Y, ANGKD_Y, 100000);
   DFOC_Y_SET_VEL_PID(SPEEDKP_Y, SPEEDKI_Y, SPEEDKD_Y, 0);
 
@@ -99,22 +114,56 @@ void loop()
   String command = serialReceiveUserCommandXY();
 
   if(command.length() > 0) {
+    unsigned long now = millis();  // 获取当前时间
+
+    // 计算两帧视觉数据是时间间隔，第一帧没有上一次时间所以加上条件语句判断是否是第一帧并且给默认数值
+    float dt = command_received ? (now - last_command_ms) * 0.001f : 0.033f;
+   
+    // 防止dt过小通信停顿后突然变大
+    dt = constrain(dt, 0.005f, 0.1f);
+
+    float visionErroeX = serial_motor_target_X(); // 获取X像素误差
+    float visionErroeY = serial_motor_target_Y(); // 获取Y像素误差
+
+    // 判断是不是在死区里。不能用 else if 必须都要执行
+    if(fabs(visionErroeX) < VISION_DEAD_ZONE) {
+      visionErroeX = 0.0f;
+    } 
+    if(fabs(visionErroeY) < VISION_DEAD_ZONE) {
+      visionErroeY = 0.0f;
+    }
+
+    // 计算云台角速度
+    float trackSpeedX = VISION_KX * VISION_DIR_X * visionErroeX;
+    float trackSpeedY = VISION_KY * VISION_DIR_Y * visionErroeY;
+
+    // 速度限幅
+    trackSpeedX = constrain(trackSpeedX, -MAX_TRACK_SPEED_X, MAX_TRACK_SPEED_X);
+    trackSpeedY = constrain(trackSpeedY, -MAX_TRACK_SPEED_Y, MAX_TRACK_SPEED_Y);
+    
+    // 角度增量 = 角速度 * 时间 是累计数值，为了后面的角度限位
+    targetX += trackSpeedX * dt;
+    targetY += trackSpeedY * dt;
+
+    // 角度限位
     targetX = constrain(
-      serial_motor_target_X(),
+      targetX,
       X_ANGLE_MIN,
       X_ANGLE_MAX
     );
 
     targetY = constrain(
-      serial_motor_target_Y(),
+      targetY,
       Y_ANGLE_MIN,
       Y_ANGLE_MAX
     );
 
+    // 保留本次视觉数据到达时间
     last_command_ms = millis();
     command_received = true;
   }
 
+  // 不管有没有数据电机闭环必须持续运行
   DFOC_X_set_Velocity_Angle(targetX);
   DFOC_Y_set_Velocity_Angle(targetY);
 
