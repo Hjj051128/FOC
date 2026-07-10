@@ -44,28 +44,34 @@ void onDebugTimer();
 
 void setup()
 {
+  // 使能X电机
   pinMode(EN_X, OUTPUT);
-  digitalWrite(EN_X, HIGH);
+  digitalWrite(EN_X, LOW);  // 暂时让X不动
 
-  // Y enable pin is reserved now. Keep it LOW so the second driver will not move yet.
+  // 使能Y电机
   pinMode(EN_Y, OUTPUT);
   digitalWrite(EN_Y, LOW);
 
   Serial.begin(115200);
 
-  // Only initialize and run X now. This keeps your tuned behavior unchanged.
+  // 初始化X电机电压
   DFOC_X_Vbus(12.0f);
   DFOC_X_alignSensor(Motor_PP_X, Sensor_DIR_X);
+
+  // X角度环PID
   DFOC_X_SET_ANGLE_PID(ANGKP_X, ANGKI_X, ANGKD_X, 100000);
+  // X速度环PID
   DFOC_X_SET_VEL_PID(SPEEDKP_X, SPEEDKI_X, SPEEDKD_X, 0);
 
   // Later, when testing Y alone, enable these lines:
-  // digitalWrite(EN_Y, HIGH);
-  // DFOC_Y_Vbus(12.0f);
-  // DFOC_Y_alignSensor(Motor_PP_Y, Sensor_DIR_Y);
-  // DFOC_Y_SET_ANGLE_PID(ANGKP_Y, ANGKI_Y, ANGKD_Y, 100000);
-  // DFOC_Y_SET_VEL_PID(SPEEDKP_Y, SPEEDKI_Y, SPEEDKD_Y, 0);
+  // 使能Y电机
+  digitalWrite(EN_Y, HIGH);
+  DFOC_Y_Vbus(12.0f);
+  DFOC_Y_alignSensor(Motor_PP_Y, Sensor_DIR_Y);
+  DFOC_Y_SET_ANGLE_PID(ANGKP_Y, ANGKI_Y, ANGKD_Y, 100000);
+  DFOC_Y_SET_VEL_PID(SPEEDKP_Y, SPEEDKI_Y, SPEEDKD_Y, 0);
 
+  // 定时器中断用于调试串口
   debug_timer = timerBegin(1000000);
   timerAttachInterrupt(debug_timer, &onDebugTimer);
   timerAlarm(debug_timer, 20000, true, 0);
@@ -75,36 +81,35 @@ void loop()
 {
   serialReceiveUserCommand();
 
-  targetX = serial_motor_target();
-  DFOC_X_set_Velocity_Angle(targetX);
+  // targetX = serial_motor_target();
+  // DFOC_X_set_Velocity_Angle(targetX);
 
   // Y is not controlled yet. Keep this disabled until Y hardware and direction are tested.
-  // targetY = 0.0f;
-  // DFOC_Y_set_Velocity_Angle(targetY);
+  targetY = serial_motor_target();
+  DFOC_Y_set_Velocity_Angle(targetY);
 
   if (print_flag) {
     print_flag = false;
 
-    angleX = DFOC_X_Angle();
-    velocityX = DFOC_X_Velocity();
-    errorX = targetX - angleX;
+    // angleX = DFOC_X_Angle();
+    // velocityX = DFOC_X_Velocity();
+    // errorX = targetX - angleX;
 
-    Serial.print(velocityX);
-    Serial.print(",");
-    Serial.print(angleX);
-    Serial.print(",");
-    Serial.println(errorX);
+    // Serial.print(velocityX);
+    // Serial.print(",");
+    // Serial.print(angleX);
+    // Serial.print(",");
+    // Serial.println(errorX);
 
-    // Later VOFA output for dual axis can be:
-    // angleY = DFOC_Y_Angle();
-    // velocityY = DFOC_Y_Velocity();
-    // errorY = targetY - angleY;
-    // Serial.print(velocityX); Serial.print(",");
-    // Serial.print(angleX); Serial.print(",");
-    // Serial.print(errorX); Serial.print(",");
-    // Serial.print(velocityY); Serial.print(",");
-    // Serial.print(angleY); Serial.print(",");
-    // Serial.println(errorY);
+  
+    angleY = DFOC_Y_Angle();        // 获取当前Y角度
+    velocityY = DFOC_Y_Velocity();  // 获取当前Y速度
+    errorY = targetY - angleY;      // 角度误差
+    Serial.print(velocityY); 
+    Serial.print(",");
+    Serial.print(angleY); 
+    Serial.print(",");
+    Serial.println(errorY);
   }
 }
 
