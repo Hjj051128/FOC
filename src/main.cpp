@@ -31,10 +31,13 @@ void setup() {
   DFOC_alignSensor(Motor_PP,Sensor_DIR);
 
   // 位置环PID
-  DFOC_M0_SET_ANGLE_PID(1.5, 0.01, 0.0, 100000);
+  // 有误差改I P也可以，P可以增加力
+
+  DFOC_M0_SET_ANGLE_PID(2.3, 0.01, 0.0, 100000);
 
   // 设置速度环PID 最后一个参数是变化速率限制，越小，输出变化越慢更柔；越大，几乎不限制
-  DFOC_M0_SET_VEL_PID(0.003,0.00,0,0);
+  // 增大P可以提速，但是可能过冲
+  DFOC_M0_SET_VEL_PID(0.006,0.00,0,0);
 
   // 创建定时器设置频率
   debug_timer = timerBegin(1000000);
