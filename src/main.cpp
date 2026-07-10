@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include "DengFOC.h"
 
-// X axis is the axis you have already tuned.
+// X PID参数
 #define ANGKP_X       2.3f
 #define ANGKI_X       0.01f
 #define ANGKD_X       0.0f
@@ -10,7 +10,7 @@
 #define SPEEDKI_X     0.0f
 #define SPEEDKD_X     0.0f
 
-// Y axis parameters are reserved here. Do not enable Y until the hardware is ready.
+// Y PID参数
 #define ANGKP_Y       2.3f
 #define ANGKI_Y       0.01f
 #define ANGKD_Y       0.0f
@@ -18,6 +18,17 @@
 #define SPEEDKP_Y     0.006f
 #define SPEEDKI_Y     0.0f
 #define SPEEDKD_Y     0.0f
+
+// 限位
+#define X_ANGLE_MIN  -1.5f
+#define X_ANGLE_MAX  1.5f
+
+#define Y_ANGLE_MIN  -1.5f
+#define Y_ANGLE_MAX  1.5f
+
+// 通信超时
+#define COMMAND_TIMEOUT_MS  500
+
 
 int Sensor_DIR_X = -1;
 int Motor_PP_X = 7;
@@ -37,6 +48,9 @@ float angleY = 0.0f;
 float velocityY = 0.0f;
 float errorY = 0.0f;
 
+unsigned long last_command_ms;
+bool command_received = false;
+
 hw_timer_t *debug_timer = NULL;
 volatile bool print_flag = false;
 
@@ -46,7 +60,7 @@ void setup()
 {
   // 使能X电机
   pinMode(EN_X, OUTPUT);
-  digitalWrite(EN_X, LOW);  // 暂时让X不动
+  digitalWrite(EN_X, HIGH);  // 暂时让X不动
 
   // 使能Y电机
   pinMode(EN_Y, OUTPUT);
@@ -71,6 +85,9 @@ void setup()
   DFOC_Y_SET_ANGLE_PID(ANGKP_Y, ANGKI_Y, ANGKD_Y, 100000);
   DFOC_Y_SET_VEL_PID(SPEEDKP_Y, SPEEDKI_Y, SPEEDKD_Y, 0);
 
+  DFOC_X_setTorque(0.0f);
+  DFOC_Y_setTorque(0.0f);
+
   // 定时器中断用于调试串口
   debug_timer = timerBegin(1000000);
   timerAttachInterrupt(debug_timer, &onDebugTimer);
@@ -79,35 +96,49 @@ void setup()
 
 void loop()
 {
-  serialReceiveUserCommand();
+  String command = serialReceiveUserCommandXY();
 
-  // targetX = serial_motor_target();
-  // DFOC_X_set_Velocity_Angle(targetX);
+  if(command.length() > 0) {
+    targetX = constrain(
+      serial_motor_target_X(),
+      X_ANGLE_MIN,
+      X_ANGLE_MAX
+    );
 
-  // Y is not controlled yet. Keep this disabled until Y hardware and direction are tested.
-  targetY = serial_motor_target();
+    targetY = constrain(
+      serial_motor_target_Y(),
+      Y_ANGLE_MIN,
+      Y_ANGLE_MAX
+    );
+
+    last_command_ms = millis();
+    command_received = true;
+  }
+
+  DFOC_X_set_Velocity_Angle(targetX);
   DFOC_Y_set_Velocity_Angle(targetY);
+
+  bool communication_online =
+    command_received &&
+    millis() - last_command_ms <= COMMAND_TIMEOUT_MS;
 
   if (print_flag) {
     print_flag = false;
-
-    // angleX = DFOC_X_Angle();
-    // velocityX = DFOC_X_Velocity();
-    // errorX = targetX - angleX;
-
-    // Serial.print(velocityX);
-    // Serial.print(",");
-    // Serial.print(angleX);
-    // Serial.print(",");
-    // Serial.println(errorX);
-
   
     angleY = DFOC_Y_Angle();        // 获取当前Y角度
     velocityY = DFOC_Y_Velocity();  // 获取当前Y速度
     errorY = targetY - angleY;      // 角度误差
+
+    angleX = DFOC_X_Angle();
+    velocityX = DFOC_X_Velocity();
+    errorX = targetX - angleX;
     Serial.print(velocityY); 
     Serial.print(",");
     Serial.print(angleY); 
+    Serial.print(",");
+    Serial.print(velocityX);
+    Serial.print(",");
+    Serial.print(angleX);
     Serial.print(",");
     Serial.println(errorY);
   }

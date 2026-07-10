@@ -45,9 +45,13 @@ TwoWire i2cX = TwoWire(0);
 Sensor_AS5600 sensorY = Sensor_AS5600(1);
 TwoWire i2cY = TwoWire(1);
 
-// 当前串口输入只解析一个目标值，暂时给X轴使用。
-// 后面做视觉ex/ey时，可以再扩展成 targetX,targetY 两个目标值。
+// 一个目标值
 float motor_target = 0.0f;
+
+// 两个目标值。
+float motor_target_X = 0.0f;
+float motor_target_Y = 0.0f;
+
 int commaPosition = 0;
 
 // 把三相电压 Ua/Ub/Uc 写到指定的三个PWM引脚。
@@ -424,9 +428,60 @@ String serialReceiveUserCommand()
   return command;
 }
 
+String serialReceiveUserCommandXY()
+{
+  static String received_chars = "";
+  String command = "";
+
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+
+    // Windows/VOFA可能发送 \r\n，这里忽略其中的 \r
+    if (inChar == '\r') {
+      continue;
+    }
+
+    // 收到换行符，说明一条完整指令接收完成
+    if (inChar == '\n') {
+      command = received_chars;
+      received_chars = "";
+
+      // 查找X、Y数据中间的逗号
+      int comma_position = command.indexOf(',');
+
+      // 逗号不能在开头或结尾，否则说明格式不正确
+      if (comma_position > 0 &&
+          comma_position < command.length() - 1) {
+
+        String x_text = command.substring(0, comma_position);
+        String y_text = command.substring(comma_position + 1);
+
+        motor_target_X = x_text.toFloat();
+        motor_target_Y = y_text.toFloat();
+      }
+    }
+    else {
+      // 当前指令还没接收完整，继续保存字符
+      received_chars += inChar;
+    }
+  }
+
+  return command;
+}
+
 float serial_motor_target()
 {
   return motor_target;
+}
+
+float serial_motor_target_X()
+{
+  return motor_target_X;
+}
+
+float serial_motor_target_Y()
+{
+  return motor_target_Y;
 }
 
 // X轴位置+速度串级控制。

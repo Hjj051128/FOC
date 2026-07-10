@@ -60,9 +60,12 @@ void DFOC_M1_Vbus(float power_supply);
 
 // 从串口接收一个数字目标值，例如发送 "1.57\n"。
 String serialReceiveUserCommand();
+String serialReceiveUserCommandXY();
 
 // 返回最近一次串口接收到的目标值。
 float serial_motor_target();
+float serial_motor_target_X();
+float serial_motor_target_Y();
 
 // ==================== 编码器读取 ====================
 
