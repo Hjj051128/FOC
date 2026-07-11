@@ -429,45 +429,54 @@ String serialReceiveUserCommand()
   return command;
 }
 
-String serialReceiveUserCommandXY()
+String serialReceiveUserCommandXY(Stream &port)
 {
   static String received_chars = "";
   String command = "";
 
-  while (Serial.available()) {
-    char inChar = (char)Serial.read();
+  while (port.available()) {
+    char inChar = (char)port.read();
 
-    // Windows/VOFA可能发送 \r\n，这里忽略其中的 \r
+    // 忽略Windows发送的回车符
     if (inChar == '\r') {
       continue;
     }
 
-    // 收到换行符，说明一条完整指令接收完成
+    // 收到换行符，说明一帧数据接收完成
     if (inChar == '\n') {
       command = received_chars;
       received_chars = "";
 
-      // 查找X、Y数据中间的逗号
       int comma_position = command.indexOf(',');
 
-      // 逗号不能在开头或结尾，否则说明格式不正确
+      // 格式必须是：数值,数值
       if (comma_position > 0 &&
           comma_position < command.length() - 1) {
 
-        String x_text = command.substring(0, comma_position);
-        String y_text = command.substring(comma_position + 1);
+        String x_text =
+            command.substring(0, comma_position);
+
+        String y_text =
+            command.substring(comma_position + 1);
 
         motor_target_X = x_text.toFloat();
         motor_target_Y = y_text.toFloat();
       }
     }
     else {
-      // 当前指令还没接收完整，继续保存字符
+      // 还没有收到换行符，继续保存字符
       received_chars += inChar;
     }
   }
 
   return command;
+}
+
+// 兼容函数
+String serialReceiveUserCommandXY()
+{
+  // 没传串口对象时，默认仍然读取USB串口
+  return serialReceiveUserCommandXY(Serial);
 }
 
 float serial_motor_target()

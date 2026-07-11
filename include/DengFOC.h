@@ -60,7 +60,12 @@ void DFOC_M1_Vbus(float power_supply);
 
 // 从串口接收一个数字目标值，例如发送 "1.57\n"。
 String serialReceiveUserCommand();
+
+// 两个函数名字相同但参数不同，C++可以通过参数判断调用哪个函数，这叫“函数重载”。
 String serialReceiveUserCommandXY();
+
+// 从指定串口接收
+String serialReceiveUserCommandXY(Stream &port);
 
 // 返回最近一次串口接收到的目标值。
 float serial_motor_target();

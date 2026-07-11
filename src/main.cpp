@@ -65,7 +65,13 @@ float errorY = 0.0f;
 unsigned long last_command_ms;
 bool command_received = false;
 
+// 创建串口对象
+HardwareSerial VisionSerial(1);   // (1) 表示绑定ESP32的UART1控制器
+
+// 创建定时器对象
 hw_timer_t *debug_timer = NULL;
+
+// 串口打印标志位
 volatile bool print_flag = false;
 
 void onDebugTimer();
@@ -80,7 +86,16 @@ void setup()
   pinMode(EN_Y, OUTPUT);
   digitalWrite(EN_Y, LOW);
 
+  // 启动默认串口
   Serial.begin(115200);
+
+  // UART1用于视觉模块
+  VisionSerial.begin(
+    115200,       // 波特率
+     SERIAL_8E1,  // 8位数据位，无校验位，1位停止位
+     16,          // RX脚
+     17           // TX脚
+    );         
 
   // 初始化X电机电压
   DFOC_X_Vbus(12.0f);
@@ -110,7 +125,7 @@ void setup()
 
 void loop()
 {
-  String command = serialReceiveUserCommandXY();
+  String command = serialReceiveUserCommandXY(VisionSerial);
 
   // 只有接收到一条完整数据才计算一次目标角度
   if(command.length() > 0) {
