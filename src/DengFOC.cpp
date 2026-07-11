@@ -194,7 +194,8 @@ void DFOC_Y_Vbus(float power_supply)
   ledcAttach(pwmBY, 30000, 8);
   ledcAttach(pwmCY, 30000, 8);
 
-  i2cY.begin(14, 15, 400000UL);
+  // Y轴I2C经过导电滑环，降到100kHz以提高抗干扰能力。
+  i2cY.begin(14, 15, 100000UL);
   sensorY.Sensor_init(&i2cY);
 
   vel_loop_Y = PIDController(2, 0, 0, 100000, voltage_power_supply / 2.0f);

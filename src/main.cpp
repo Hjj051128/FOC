@@ -19,7 +19,6 @@
 #define SPEEDKI_Y     0.0f
 #define SPEEDKD_Y     0.0f
 
-
 // 电机方向极性
 #define SENSOR_DIR_X  -1
 #define SENSOR_DIR_Y  -1
@@ -113,6 +112,7 @@ void loop()
 {
   String command = serialReceiveUserCommandXY();
 
+  // 只有接收到一条完整数据才计算一次目标角度
   if(command.length() > 0) {
     unsigned long now = millis();  // 获取当前时间
 
@@ -141,6 +141,7 @@ void loop()
     trackSpeedX = constrain(trackSpeedX, -MAX_TRACK_SPEED_X, MAX_TRACK_SPEED_X);
     trackSpeedY = constrain(trackSpeedY, -MAX_TRACK_SPEED_Y, MAX_TRACK_SPEED_Y);
     
+    // 一帧只让云台运动一小段距离
     // 角度增量 = 角速度 * 时间 是累计数值，为了后面的角度限位
     targetX += trackSpeedX * dt;
     targetY += trackSpeedY * dt;
