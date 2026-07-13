@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "DengFOC.h"
+#include "ICM42688.h"
 
 // X PID参数
 #define ANGKP_X       2.3f
@@ -47,6 +48,13 @@
 #define VISION_DIR_X         1.0     // X轴视觉误差方向
 #define VISION_DIR_Y         1.0     // Y轴视觉误差方向
 
+// ICM-42688使用独立SPI总线
+#define IMU_SPI_SCLK         42      // SCLK引脚
+#define IMU_SPI_MISO         40      // MISO引脚
+#define IMU_SPI_MOSI         41      // MOSI引脚
+#define IMU_SPI_CS           39      // CS片选引脚
+#define IMU_SAMPLE_PERIOD_US 2000UL  // 500Hz采样周期。
+
 
 // 电机引脚
 int EN_X = 7;
@@ -67,6 +75,21 @@ bool command_received = false;
 
 // 创建串口对象
 HardwareSerial VisionSerial(1);   // (1) 表示绑定ESP32的UART1控制器
+
+// 创建ICM42688Sensor类
+ICM42688Sensor imu(
+  SPI,
+  IMU_SPI_SCLK,
+  IMU_SPI_MISO,
+  IMU_SPI_MOSI,
+  IMU_SPI_CS
+);
+
+// IMU初始化成功标志位。失败不进行数据读取
+bool imu_ready = false;
+
+// IMU上一次采样时间戳，用来控制采样频率
+unsigned long last_imu_sample_us = 0;
 
 // 创建定时器对象
 hw_timer_t *debug_timer = NULL;
@@ -96,6 +119,19 @@ void setup()
      16,          // RX脚
      17           // TX脚
     );         
+
+  // 初始化后保持云台静止约1秒，用于估算陀螺仪零偏。
+  imu_ready = imu.begin();
+  if (imu_ready) {
+    Serial.println("ICM42688 SPI connected, calibrating gyro...");
+    imu_ready = imu.calibrateGyro();
+  }
+  if (imu_ready) {
+    Serial.println("ICM42688 gyro calibration complete");
+  } else {
+    Serial.print("ICM42688 init failed, WHO_AM_I=0x");
+    Serial.println(imu.whoAmI(), HEX);
+  }
 
   // 初始化X电机电压
   DFOC_X_Vbus(12.0f);
@@ -183,6 +219,17 @@ void loop()
   DFOC_X_set_Velocity_Angle(targetX);
   DFOC_Y_set_Velocity_Angle(targetY);
 
+  // 以500Hz读取IMU。读取失败时保留上一帧，不影响现有电机闭环。
+  const unsigned long now_us = micros();
+  if (
+    imu_ready &&
+    static_cast<unsigned long>(now_us - last_imu_sample_us) >=
+      IMU_SAMPLE_PERIOD_US
+  ) {
+    last_imu_sample_us = now_us;
+    imu.read();
+  }
+
   bool communication_online =
     command_received &&
     millis() - last_command_ms <= COMMAND_TIMEOUT_MS;
@@ -197,15 +244,31 @@ void loop()
     angleX = DFOC_X_Angle();
     velocityX = DFOC_X_Velocity();
     errorX = targetX - angleX;
-    Serial.print(velocityY); 
+    // Serial.print(velocityY); 
+    // Serial.print(",");
+    // Serial.print(angleY); 
+    // Serial.print(",");
+    // Serial.print(velocityX);
+    // Serial.print(",");
+    // Serial.print(angleX);
+    // Serial.print(",");
+    // Serial.print(errorY);
+    // Serial.print(",");
+
+    // VOFA新增六个通道：陀螺仪XYZ和加速度计XYZ。
+    // 库内定义结构体，存放读取的数据 sample:IMU类成员函数，返回上一次read缓存的数据
+    const ICM42688Sample &imu_sample = imu.sample();  // 这里取地址，不用拷贝内存，直接使用
+    Serial.print(imu_ready ? imu_sample.gyroX : 0.0f); // X轴角速度，单位 deg/s
     Serial.print(",");
-    Serial.print(angleY); 
+    Serial.print(imu_ready ? imu_sample.gyroY : 0.0f);    // Y轴角速度，单位 deg/s
     Serial.print(",");
-    Serial.print(velocityX);
+    Serial.print(imu_ready ? imu_sample.gyroZ : 0.0f);    // Z轴角速度，单位 deg/s
     Serial.print(",");
-    Serial.print(angleX);
+    Serial.print(imu_ready ? imu_sample.accelX : 0.0f);   // X轴加速度，单位 g
     Serial.print(",");
-    Serial.println(errorY);
+    Serial.print(imu_ready ? imu_sample.accelY : 0.0f);   // Y轴加速度，单位 g
+    Serial.print(",");
+    Serial.println(imu_ready ? imu_sample.accelZ : 0.0f); // Z轴加速度，单位 g
   }
 }
 
