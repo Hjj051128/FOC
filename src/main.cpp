@@ -3,6 +3,7 @@
 #include "ICM42688.h"
 #include "WiFi.h"
 #include "WiFiUdp.h"
+#include <Preferences.h>
 
 // X PID参数
 #define ANGKP_X       2.3f
@@ -76,6 +77,8 @@ float yAngKd = ANGKD_Y;
 float visionKx = VISION_KX;
 float visionKy = VISION_KY;
 
+Preferences preferences;
+
 // 电机引脚
 int EN_X = 7;
 int EN_Y = 13;
@@ -111,6 +114,9 @@ void sendVofa(
 
 // 本地接收
 void receiveUdpCommand();
+void loadParameters();
+void saveParameters();
+void resetParameters();
 
 // 创建串口对象
 HardwareSerial VisionSerial(1);   // (1) 表示绑定ESP32的UART1控制器
@@ -140,6 +146,9 @@ void onDebugTimer();
 
 void setup()
 {
+  preferences.begin("gimbal", false);
+  loadParameters();
+
   // 使能X电机
   pinMode(EN_X, OUTPUT);
   digitalWrite(EN_X, HIGH);  // 暂时让X不动
@@ -167,7 +176,7 @@ void setup()
   DFOC_X_alignSensor(MOTOR_PP_X, SENSOR_DIR_X);
 
   // X角度环PID
-  DFOC_X_SET_ANGLE_PID(ANGKP_X, ANGKI_X, ANGKD_X, 100000);
+  DFOC_X_SET_ANGLE_PID(xAngKp, xAngKi, xAngKd, 100000);
   // X速度环PID
   DFOC_X_SET_VEL_PID(SPEEDKP_X, SPEEDKI_X, SPEEDKD_X, 0);
 
@@ -176,7 +185,7 @@ void setup()
   digitalWrite(EN_Y, HIGH);
   DFOC_Y_Vbus(12.0f);
   DFOC_Y_alignSensor(MOTOR_PP_Y, SENSOR_DIR_Y);
-  DFOC_Y_SET_ANGLE_PID(ANGKP_Y, ANGKI_Y, ANGKD_Y, 100000);
+  DFOC_Y_SET_ANGLE_PID(yAngKp, yAngKi, yAngKd, 100000);
   DFOC_Y_SET_VEL_PID(SPEEDKP_Y, SPEEDKI_Y, SPEEDKD_Y, 0);
 
   DFOC_X_setTorque(0.0f);
@@ -291,14 +300,7 @@ void onDebugTimer()
 }
 
 // VOFA发送函数
-void sendVofa(
-  float ch1,
-  float ch2,
-  float ch3,
-  float ch4,
-  float ch5,
-  float ch6
-) {
+void sendVofa(float ch1, float ch2, float ch3, float ch4, float ch5, float ch6) {
   // 创建一个缓冲区
   char buffer[96];
   snprintf(
@@ -323,7 +325,68 @@ void sendVofa(
   udp.endPacket();
 }
 
-// 
+float loadFloatInRange(
+  const char *key,
+  float defaultValue,
+  float minValue,
+  float maxValue
+) {
+  float value = preferences.getFloat(key, defaultValue);
+
+  if (value >= minValue && value <= maxValue) {
+    return value;
+  }
+
+  return defaultValue;
+}
+
+void loadParameters() {
+  xAngKp = loadFloatInRange("xap", ANGKP_X, ANGKP_MIN, ANGKP_MAX);
+  xAngKi = loadFloatInRange("xai", ANGKI_X, ANGKI_MIN, ANGKI_MAX);
+  xAngKd = loadFloatInRange("xad", ANGKD_X, ANGKD_MIN, ANGKD_MAX);
+
+  yAngKp = loadFloatInRange("yap", ANGKP_Y, ANGKP_MIN, ANGKP_MAX);
+  yAngKi = loadFloatInRange("yai", ANGKI_Y, ANGKI_MIN, ANGKI_MAX);
+  yAngKd = loadFloatInRange("yad", ANGKD_Y, ANGKD_MIN, ANGKD_MAX);
+
+  visionKx = loadFloatInRange(
+    "vkx",
+    VISION_KX,
+    VISION_K_MIN,
+    VISION_K_MAX
+  );
+  visionKy = loadFloatInRange(
+    "vky",
+    VISION_KY,
+    VISION_K_MIN,
+    VISION_K_MAX
+  );
+}
+
+void saveParameters() {
+  preferences.putFloat("xap", xAngKp);
+  preferences.putFloat("xai", xAngKi);
+  preferences.putFloat("xad", xAngKd);
+  preferences.putFloat("yap", yAngKp);
+  preferences.putFloat("yai", yAngKi);
+  preferences.putFloat("yad", yAngKd);
+  preferences.putFloat("vkx", visionKx);
+  preferences.putFloat("vky", visionKy);
+}
+
+void resetParameters() {
+  xAngKp = ANGKP_X;
+  xAngKi = ANGKI_X;
+  xAngKd = ANGKD_X;
+  yAngKp = ANGKP_Y;
+  yAngKi = ANGKI_Y;
+  yAngKd = ANGKD_Y;
+  visionKx = VISION_KX;
+  visionKy = VISION_KY;
+
+  saveParameters();
+}
+
 void receiveUdpCommand() {
   // 解析接收数据包，返回值是数据包大小单位字节
   int packetSize = udp.parsePacket();
@@ -417,6 +480,20 @@ void receiveUdpCommand() {
     if (value >= VISION_K_MIN && value <= VISION_K_MAX) {
       visionKy = value;
       updated = true;
+    }
+  }
+  else if (strcmp(name, "SAVE") == 0) {
+    if (value == 1.0f) {
+      saveParameters();
+      updated = true;
+    }
+  }
+  else if (strcmp(name, "RESET") == 0) {
+    if (value == 1.0f) {
+      resetParameters();
+      updated = true;
+      xAnglePidUpdated = true;
+      yAnglePidUpdated = true;
     }
   }
 
