@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include "DengFOC.h"
 #include "ICM42688.h"
+#include "WiFi.h"
+#include "WiFiUdp.h"
 
 // X PID参数
 #define ANGKP_X       2.3f
@@ -38,7 +40,6 @@
 // 通信超时
 #define COMMAND_TIMEOUT_MS  500
 
-
 // 视觉跟踪参数
 #define VISION_KX            0.002f  // x轴像素误差转换到速度的比例
 #define VISION_KY            0.002f  // y轴像素误差转换到速度的比例
@@ -72,6 +73,27 @@ float errorY = 0.0f;
 
 unsigned long last_command_ms;
 bool command_received = false;
+
+// 设置创建热点的信息
+const char *ssid = "ESP32_S3";      // ID
+const char *password = "66666666"; // 连接密码
+
+// 创建UDP对象，不需要建立握手。使用 UDP 协议收发数据包，实现上位机和云台无线通信。
+WiFiUDP udp;
+
+// vofa地址和端口
+const IPAddress vofaIp(192, 168, 4, 255);  // 广播转发
+const uint16_t vofaPort = 1347;            // VOFA端口号
+
+// VOFA发送函数
+void sendVofa(
+  float ch1,
+  float ch2,
+  float ch3,
+  float ch4,
+  float ch5,
+  float ch6
+);
 
 // 创建串口对象
 HardwareSerial VisionSerial(1);   // (1) 表示绑定ESP32的UART1控制器
@@ -109,9 +131,6 @@ void setup()
   pinMode(EN_Y, OUTPUT);
   digitalWrite(EN_Y, LOW);
 
-  // 启动默认串口
-  Serial.begin(115200);
-
   // UART1用于视觉模块
   VisionSerial.begin(
     115200,       // 波特率
@@ -123,14 +142,7 @@ void setup()
   // 初始化后保持云台静止约1秒，用于估算陀螺仪零偏。
   imu_ready = imu.begin();
   if (imu_ready) {
-    Serial.println("ICM42688 SPI connected, calibrating gyro...");
     imu_ready = imu.calibrateGyro();
-  }
-  if (imu_ready) {
-    Serial.println("ICM42688 gyro calibration complete");
-  } else {
-    Serial.print("ICM42688 init failed, WHO_AM_I=0x");
-    Serial.println(imu.whoAmI(), HEX);
   }
 
   // 初始化X电机电压
@@ -157,6 +169,12 @@ void setup()
   debug_timer = timerBegin(1000000);
   timerAttachInterrupt(debug_timer, &onDebugTimer);
   timerAlarm(debug_timer, 20000, true, 0);
+
+  // 设置WIFI模式 AP：Access Point：路由器模式
+  WiFi.mode(WIFI_AP);
+  // 创建热点 ID 密码 
+  WiFi.softAP(ssid, password);
+  udp.begin(vofaPort);
 }
 
 void loop()
@@ -244,35 +262,54 @@ void loop()
     angleX = DFOC_X_Angle();
     velocityX = DFOC_X_Velocity();
     errorX = targetX - angleX;
-    // Serial.print(velocityY); 
-    // Serial.print(",");
-    // Serial.print(angleY); 
-    // Serial.print(",");
-    // Serial.print(velocityX);
-    // Serial.print(",");
-    // Serial.print(angleX);
-    // Serial.print(",");
-    // Serial.print(errorY);
-    // Serial.print(",");
-
     // VOFA新增六个通道：陀螺仪XYZ和加速度计XYZ。
     // 库内定义结构体，存放读取的数据 sample:IMU类成员函数，返回上一次read缓存的数据
     const ICM42688Sample &imu_sample = imu.sample();  // 这里取地址，不用拷贝内存，直接使用
-    Serial.print(imu_ready ? imu_sample.gyroX : 0.0f); // X轴角速度，单位 deg/s
-    Serial.print(",");
-    Serial.print(imu_ready ? imu_sample.gyroY : 0.0f);    // Y轴角速度，单位 deg/s
-    Serial.print(",");
-    Serial.print(imu_ready ? imu_sample.gyroZ : 0.0f);    // Z轴角速度，单位 deg/s
-    Serial.print(",");
-    Serial.print(imu_ready ? imu_sample.accelX : 0.0f);   // X轴加速度，单位 g
-    Serial.print(",");
-    Serial.print(imu_ready ? imu_sample.accelY : 0.0f);   // Y轴加速度，单位 g
-    Serial.print(",");
-    Serial.println(imu_ready ? imu_sample.accelZ : 0.0f); // Z轴加速度，单位 g
+    sendVofa(
+      imu_ready ? imu_sample.gyroX : 0.0f,
+      imu_ready ? imu_sample.gyroY : 0.0f,
+      imu_ready ? imu_sample.gyroZ : 0.0f,
+      imu_ready ? imu_sample.accelX : 0.0f,
+      imu_ready ? imu_sample.accelY : 0.0f,
+      imu_ready ? imu_sample.accelZ : 0.0f
+    );
   }
 }
 
 void onDebugTimer()
 {
   print_flag = true;
+}
+
+// VOFA发送函数
+void sendVofa(
+  float ch1,
+  float ch2,
+  float ch3,
+  float ch4,
+  float ch5,
+  float ch6
+) {
+  // 创建一个缓冲区
+  char buffer[96];
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+    ch1,
+    ch2,
+    ch3,
+    ch4,
+    ch5,
+    ch6
+  );
+
+  // 创建一个UDP包，参数是IP地址跟端口
+  udp.beginPacket(vofaIp, vofaPort);
+
+  // 把buffer里面的数据存放包里
+  udp.write((const uint8_t *)buffer, strlen(buffer));
+
+  // 发送数据
+  udp.endPacket();
 }

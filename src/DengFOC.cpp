@@ -179,7 +179,6 @@ void DFOC_X_Vbus(float power_supply)
   sensorX.Sensor_init(&i2cX);
 
   vel_loop_X = PIDController(2, 0, 0, 100000, voltage_power_supply / 2.0f);
-  Serial.println("X axis PWM and AS5600 init done");
 }
 
 // 初始化Y轴：配置三相PWM，启动第二路I2C上的Y轴AS5600。
@@ -199,7 +198,6 @@ void DFOC_Y_Vbus(float power_supply)
   sensorY.Sensor_init(&i2cY);
 
   vel_loop_Y = PIDController(2, 0, 0, 100000, voltage_power_supply / 2.0f);
-  Serial.println("Y axis PWM and AS5600 init done");
 }
 
 // 旧初始化接口：保留给以前代码用，默认初始化X轴。
@@ -227,8 +225,6 @@ void DFOC_X_alignSensor(int _PP, int _DIR)
   zero_electric_angle_X = _electricalAngleX();
   setTorqueX(0.0f, _3PI_2);
 
-  Serial.print("X zero electric angle: ");
-  Serial.println(zero_electric_angle_X);
 }
 
 // Y轴传感器校准。逻辑和X轴完全一样，但使用Y轴硬件。
@@ -243,8 +239,6 @@ void DFOC_Y_alignSensor(int _PP, int _DIR)
   zero_electric_angle_Y = _electricalAngleY();
   setTorqueY(0.0f, _3PI_2);
 
-  Serial.print("Y zero electric angle: ");
-  Serial.println(zero_electric_angle_Y);
 }
 
 // 旧校准接口：保留给以前代码用，默认校准X轴。
@@ -409,24 +403,7 @@ float DFOC_M1_ANGLE_PID(float error)
 // 当前格式：发送 "1.57\n" 这种单个数字，保存到 motor_target。
 String serialReceiveUserCommand()
 {
-  static String received_chars;
-  String command = "";
-
-  while (Serial.available()) {
-    char inChar = (char)Serial.read();
-    received_chars += inChar;
-
-    if (inChar == '\n') {
-      command = received_chars;
-      commaPosition = command.indexOf('\n');
-      if (commaPosition != -1) {
-        motor_target = command.substring(0, commaPosition).toDouble();
-        Serial.println(motor_target);
-      }
-      received_chars = "";
-    }
-  }
-  return command;
+  return "";
 }
 
 String serialReceiveUserCommandXY(Stream &port)
