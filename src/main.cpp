@@ -1,4 +1,4 @@
-#include <Arduino.h>
+﻿#include <Arduino.h>
 #include "DengFOC.h"
 #include "ICM42688.h"
 #include "WiFi.h"
@@ -22,6 +22,18 @@
 #define SPEEDKI_Y     0.0f
 #define SPEEDKD_Y     0.0f
 
+// WiFi调参范围，X/Y角度环共用
+#define ANGKP_MIN     0.0f
+#define ANGKP_MAX     10.0f
+#define ANGKI_MIN     0.0f
+#define ANGKI_MAX     1.0f
+#define ANGKD_MIN     0.0f
+#define ANGKD_MAX     1.0f
+
+// WiFi视觉跟踪比例调参范围
+#define VISION_K_MIN  0.0f
+#define VISION_K_MAX  0.1f
+
 // 电机方向极性
 #define SENSOR_DIR_X  -1
 #define SENSOR_DIR_Y  -1
@@ -36,9 +48,6 @@
 
 #define Y_ANGLE_MIN  -1.5f
 #define Y_ANGLE_MAX  1.5f
-
-// 通信超时
-#define COMMAND_TIMEOUT_MS  500
 
 // 视觉跟踪参数
 #define VISION_KX            0.002f  // x轴像素误差转换到速度的比例
@@ -56,20 +65,24 @@
 #define IMU_SPI_CS           39      // CS片选引脚
 #define IMU_SAMPLE_PERIOD_US 2000UL  // 500Hz采样周期。
 
+float xAngKp = ANGKP_X;
+float xAngKi = ANGKI_X;
+float xAngKd = ANGKD_X;
+
+float yAngKp = ANGKP_Y;
+float yAngKi = ANGKI_Y;
+float yAngKd = ANGKD_Y;
+
+float visionKx = VISION_KX;
+float visionKy = VISION_KY;
 
 // 电机引脚
 int EN_X = 7;
 int EN_Y = 13;
 
 float targetX = 0.0f;
-float angleX = 0.0f;
-float velocityX = 0.0f;
-float errorX = 0.0f;
 
 float targetY = 0.0f;
-float angleY = 0.0f;
-float velocityY = 0.0f;
-float errorY = 0.0f;
 
 unsigned long last_command_ms;
 bool command_received = false;
@@ -83,7 +96,8 @@ WiFiUDP udp;
 
 // vofa地址和端口
 const IPAddress vofaIp(192, 168, 4, 255);  // 广播转发
-const uint16_t vofaPort = 1347;            // VOFA端口号
+const uint16_t vofaPort = 1347;            // ESP发送端口号
+const uint16_t udpPort = 1346;             // ESP接收端口号
 
 // VOFA发送函数
 void sendVofa(
@@ -94,6 +108,9 @@ void sendVofa(
   float ch5,
   float ch6
 );
+
+// 本地接收
+void receiveUdpCommand();
 
 // 创建串口对象
 HardwareSerial VisionSerial(1);   // (1) 表示绑定ESP32的UART1控制器
@@ -174,11 +191,13 @@ void setup()
   WiFi.mode(WIFI_AP);
   // 创建热点 ID 密码 
   WiFi.softAP(ssid, password);
-  udp.begin(vofaPort);
+  // 监听本地端口传来的数据
+  udp.begin(udpPort);
 }
 
 void loop()
 {
+  receiveUdpCommand();
   String command = serialReceiveUserCommandXY(VisionSerial);
 
   // 只有接收到一条完整数据才计算一次目标角度
@@ -203,8 +222,8 @@ void loop()
     }
 
     // 计算云台角速度
-    float trackSpeedX = VISION_KX * VISION_DIR_X * visionErroeX;
-    float trackSpeedY = VISION_KY * VISION_DIR_Y * visionErroeY;
+    float trackSpeedX = visionKx * VISION_DIR_X * visionErroeX;
+    float trackSpeedY = visionKy * VISION_DIR_Y * visionErroeY;
 
     // 速度限幅
     trackSpeedX = constrain(trackSpeedX, -MAX_TRACK_SPEED_X, MAX_TRACK_SPEED_X);
@@ -248,20 +267,10 @@ void loop()
     imu.read();
   }
 
-  bool communication_online =
-    command_received &&
-    millis() - last_command_ms <= COMMAND_TIMEOUT_MS;
-
+  // VOFA打印
   if (print_flag) {
     print_flag = false;
-  
-    angleY = DFOC_Y_Angle();        // 获取当前Y角度
-    velocityY = DFOC_Y_Velocity();  // 获取当前Y速度
-    errorY = targetY - angleY;      // 角度误差
 
-    angleX = DFOC_X_Angle();
-    velocityX = DFOC_X_Velocity();
-    errorX = targetX - angleX;
     // VOFA新增六个通道：陀螺仪XYZ和加速度计XYZ。
     // 库内定义结构体，存放读取的数据 sample:IMU类成员函数，返回上一次read缓存的数据
     const ICM42688Sample &imu_sample = imu.sample();  // 这里取地址，不用拷贝内存，直接使用
@@ -312,4 +321,143 @@ void sendVofa(
 
   // 发送数据
   udp.endPacket();
+}
+
+// 
+void receiveUdpCommand() {
+  // 解析接收数据包，返回值是数据包大小单位字节
+  int packetSize = udp.parsePacket();
+
+  if (packetSize <= 0) {
+    return;
+  }
+
+  // 定义缓冲区
+  char buffer[64];
+
+  // 读取数据到缓冲区
+  int len = udp.read(buffer, sizeof(buffer) - 1);
+
+  if (len <= 0) {
+    return;
+  }
+
+  buffer[len] = '\0';
+
+  // 定义名称缓冲区
+  char name[8];
+  // 数值缓冲区
+  float value;
+
+  // 格式转换
+  int count = sscanf(
+    buffer,
+    "%7[^,],%f",
+    name,
+    &value
+  );
+
+  if (count != 2) {
+    return;
+  }
+
+  bool updated = false;
+  bool xAnglePidUpdated = false;
+  bool yAnglePidUpdated = false;
+
+  if (strcmp(name, "XAP") == 0) {
+    if (value >= ANGKP_MIN && value <= ANGKP_MAX) {
+      xAngKp = value;
+      updated = true;
+      xAnglePidUpdated = true;
+    }
+  }
+  else if (strcmp(name, "XAI") == 0) {
+    if (value >= ANGKI_MIN && value <= ANGKI_MAX) {
+      xAngKi = value;
+      updated = true;
+      xAnglePidUpdated = true;
+    }
+  }
+  else if (strcmp(name, "XAD") == 0) {
+    if (value >= ANGKD_MIN && value <= ANGKD_MAX) {
+      xAngKd = value;
+      updated = true;
+      xAnglePidUpdated = true;
+    }
+  }
+  else if (strcmp(name, "YAP") == 0) {
+    if (value >= ANGKP_MIN && value <= ANGKP_MAX) {
+      yAngKp = value;
+      updated = true;
+      yAnglePidUpdated = true;
+    }
+  }
+  else if (strcmp(name, "YAI") == 0) {
+    if (value >= ANGKI_MIN && value <= ANGKI_MAX) {
+      yAngKi = value;
+      updated = true;
+      yAnglePidUpdated = true;
+    }
+  }
+  else if (strcmp(name, "YAD") == 0) {
+    if (value >= ANGKD_MIN && value <= ANGKD_MAX) {
+      yAngKd = value;
+      updated = true;
+      yAnglePidUpdated = true;
+    }
+  }
+  else if (strcmp(name, "VKX") == 0) {
+    if (value >= VISION_K_MIN && value <= VISION_K_MAX) {
+      visionKx = value;
+      updated = true;
+    }
+  }
+  else if (strcmp(name, "VKY") == 0) {
+    if (value >= VISION_K_MIN && value <= VISION_K_MAX) {
+      visionKy = value;
+      updated = true;
+    }
+  }
+
+  if (!updated) {
+    return;
+  }
+
+  if (xAnglePidUpdated) {
+    DFOC_X_SET_ANGLE_PID(
+      xAngKp,
+      xAngKi,
+      xAngKd,
+      100000
+    );
+  }
+
+  if (yAnglePidUpdated) {
+    DFOC_Y_SET_ANGLE_PID(
+      yAngKp,
+      yAngKi,
+      yAngKd,
+      100000
+    );
+  }
+
+  // 把当前X、Y角度环参数返回VOFA
+  // char reply[96];
+
+  // snprintf(
+  //   reply,
+  //   sizeof(reply),
+  //   "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+  //   xAngKp,
+  //   xAngKi,
+  //   xAngKd,
+  //   yAngKp,
+  //   yAngKi,
+  //   yAngKd
+  // );
+
+  // udp.beginPacket(vofaIp, vofaPort);
+  // udp.write((const uint8_t *)reply, strlen(reply));
+  // udp.endPacket();
 }
