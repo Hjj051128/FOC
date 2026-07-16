@@ -80,6 +80,10 @@
 #define VISION_DIR_X         1.0     // X轴视觉误差方向
 #define VISION_DIR_Y         1.0     // Y轴视觉误差方向
 
+#define DEBUG_PIN   18  // 调试引脚
+
+bool DebugMode = false;  // 调试模式
+
 
 // ============================== 可运行时修改的参数变量 ==============================
 // 宏定义本身不能在程序运行过程中改变，所以另外建立 float 变量。
@@ -147,14 +151,18 @@ void resetParameters();    // 恢复代码中的默认值并写入Flash
 // 创建串口对象
 HardwareSerial VisionSerial(1);   // (1) 表示绑定ESP32的UART1控制器
 
-void setup()
-{
+void setup() {
+
+  // 读取模式
+  pinMode(DEBUG_PIN, INPUT_PULLUP);
+  delay(30);  // 按键消抖
+
+  DebugMode = digitalRead(DEBUG_PIN) == LOW;
 
   // 打开名为“gimbal”的NVS命名空间。
   // false 表示以“可读可写”方式打开；若为 true 则仅允许读取。
   preferences.begin("gimbal", false);
   loadParameters();
-
 
   // 使能电机引脚 
   pinMode(EN_X, OUTPUT);
@@ -170,7 +178,6 @@ void setup()
      16,          // RX脚
      17           // TX脚
     );         
-
 
   DFOC_X_Vbus(12.0f);
   DFOC_X_alignSensor(MOTOR_PP_X, SENSOR_DIR_X); // 随后进行编码器与电机电角度的对齐。
@@ -191,11 +198,14 @@ void setup()
   DFOC_Y_setTorque(0.0f);
 
 
-  WiFi.mode(WIFI_AP);
-  // 创建热点 ID 密码 
-  WiFi.softAP(ssid, password);
-  // 监听本地端口传来的数据
-  udp.begin(udpPort);
+  if(DebugMode) {
+    WiFi.mode(WIFI_AP);
+    // 创建热点 ID 密码 
+    WiFi.softAP(ssid, password);
+    // 监听本地端口传来的数据
+    udp.begin(udpPort);
+  }
+  
 }
 
 
@@ -203,7 +213,9 @@ void loop()
 {
 
   // 非阻塞检查UDP接收区。没有数据时函数会立即return，不会卡住主循环。
-  receiveUdpCommand();
+  if(DebugMode) {
+    receiveUdpCommand();
+  }
 
   // 从UART1读取并解析视觉模块的一条完整命令。
   String command = serialReceiveUserCommandXY(VisionSerial);
@@ -403,7 +415,6 @@ void receiveUdpCommand() {
   // 解析接收数据包，返回值是数据包大小单位字节
   int packetSize = udp.parsePacket();
 
-
   // 没收到有效数据包时立即结束函数，主循环继续执行其他任务。
   if (packetSize <= 0) {
     return;
@@ -415,12 +426,10 @@ void receiveUdpCommand() {
   // 读取数据到缓冲区
   int len = udp.read(buffer, sizeof(buffer) - 1);
 
-
   // read失败或没有读到内容时，直接退出。
   if (len <= 0) {
     return;
   }
-
 
   // UDP收到的是原始字节，不一定自带C字符串结束符。
   buffer[len] = '\0';
@@ -568,7 +577,6 @@ void receiveUdpCommand() {
       100000
     );
   }
-
 
   // Y轴角度参数变化后同样立即刷新控制器。
   if (yAnglePidUpdated) {
