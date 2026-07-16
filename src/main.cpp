@@ -82,6 +82,9 @@
 
 #define DEBUG_PIN   18  // 调试引脚
 
+#define MECHANICAL_ZERO_MIN  (-2.0f * PI)
+#define MECHANICAL_ZERO_MAX  ( 2.0f * PI)
+
 bool DebugMode = false;  // 调试模式
 
 
@@ -98,6 +101,14 @@ float yAngKd = ANGKD_Y;
 
 float visionKx = VISION_KX;
 float visionKy = VISION_KY;
+
+// 机械零点
+float mechanicalZeroX = 0.0f;
+float mechanicalZeroY = 0.0f;
+bool mechanicalZeroValid = false;
+
+// 对齐模式标志位
+bool mechanicalCalibrationMode = false;
 
 
 // Preferences 对象用于访问 ESP32 的 NVS 非易失性存储区。
@@ -144,7 +155,7 @@ const uint16_t udpPort = 1346;
 void receiveUdpCommand();  // 检查并解析一条VOFA命令
 void loadParameters();     // 开机时从Flash读取参数
 void saveParameters();     // 把当前参数写入Flash
-void resetParameters();    // 恢复代码中的默认值并写入Flash
+void resetParameters();    // 恢复PID和视觉默认值并写入Flash
 
 
 // ============================== 视觉模块串口 ==============================
@@ -182,15 +193,27 @@ void setup() {
   DFOC_X_Vbus(12.0f);
   DFOC_X_alignSensor(MOTOR_PP_X, SENSOR_DIR_X); // 随后进行编码器与电机电角度的对齐。
 
-  // X角度环PID
+  DFOC_Y_Vbus(12.0f);
+  DFOC_Y_alignSensor(MOTOR_PP_Y, SENSOR_DIR_Y);
+
+  // 只有完成过机械零点校准时才启用，首次上电保持原来的累计角度行为。
+  if (mechanicalZeroValid) {
+    DFOC_SET_MECHANICAL_ZERO(
+      mechanicalZeroX,
+      mechanicalZeroY
+    );
+  }
+  else {
+    DFOC_CLEAR_MECHANICAL_ZERO();
+  }
+
+  DFOC_Y_SET_ANGLE_PID(yAngKp, yAngKi, yAngKd, 100000);
+  DFOC_Y_SET_VEL_PID(SPEEDKP_Y, SPEEDKI_Y, SPEEDKD_Y, 0);
+
+    // X角度环PID
   DFOC_X_SET_ANGLE_PID(xAngKp, xAngKi, xAngKd, 100000);
   // X速度环PID
   DFOC_X_SET_VEL_PID(SPEEDKP_X, SPEEDKI_X, SPEEDKD_X, 0);
-
-  DFOC_Y_Vbus(12.0f);
-  DFOC_Y_alignSensor(MOTOR_PP_Y, SENSOR_DIR_Y);
-  DFOC_Y_SET_ANGLE_PID(yAngKp, yAngKi, yAngKd, 100000);
-  DFOC_Y_SET_VEL_PID(SPEEDKP_Y, SPEEDKI_Y, SPEEDKD_Y, 0);
 
 
   // 初始化结束后先把两个轴的转矩指令设为0，
@@ -212,18 +235,13 @@ void setup() {
 void loop()
 {
 
-  // 非阻塞检查UDP接收区。没有数据时函数会立即return，不会卡住主循环。
-  if(DebugMode) {
-    receiveUdpCommand();
-  }
-
   // 从UART1读取并解析视觉模块的一条完整命令。
-  String command = serialReceiveUserCommandXY(VisionSerial);
+  bool visionFrameReceived = serialReceiveUserCommandXY(VisionSerial);
 
 
   // 只有视觉数据更新时，才重新计算一次视觉目标角度。
   // 如果本轮没有新视觉帧，targetX和targetY保持原值，
-  if(command.length() > 0) {
+  if(visionFrameReceived && !mechanicalCalibrationMode) {
 
     // millis()返回系统启动后的毫秒数，类型为unsigned long。
     unsigned long now = millis();  // 获取当前时间
@@ -274,7 +292,7 @@ void loop()
     );
 
     // 保留本次视觉数据到达时间
-    last_command_ms = millis();
+    last_command_ms = now;
     command_received = true;
   }
 
@@ -283,8 +301,19 @@ void loop()
   // 即使视觉暂时没有新数据，电机也要继续保持上一次目标角度。
   // 函数名中 Velocity_Angle 表示库内部采用速度环+角度环串级控制。
   // 不管有没有数据电机闭环必须持续运行
-  DFOC_X_set_Velocity_Angle(targetX);
-  DFOC_Y_set_Velocity_Angle(targetY);
+  if (mechanicalCalibrationMode) {
+    DFOC_X_setTorque(0.0f);
+    DFOC_Y_setTorque(0.0f);
+  }
+  else {
+    DFOC_X_set_Velocity_Angle(targetX);
+    DFOC_Y_set_Velocity_Angle(targetY);
+  }
+
+  // 电机控制优先完成，再非阻塞检查UDP调参命令。
+  if(DebugMode) {
+    receiveUdpCommand();
+  }
 }
 
 
@@ -351,6 +380,23 @@ void loadParameters() {
     VISION_K_MIN,
     VISION_K_MAX
   );
+
+  mechanicalZeroX = loadFloatInRange(
+    "mzx",
+    0.0f,
+    MECHANICAL_ZERO_MIN,
+    MECHANICAL_ZERO_MAX
+  );
+
+  mechanicalZeroY = loadFloatInRange(
+    "mzy",
+    0.0f,
+    MECHANICAL_ZERO_MIN,
+    MECHANICAL_ZERO_MAX
+  );
+
+  // mzv用于区分“零点数值恰好为0”和“从未进行过机械零点校准”。
+  mechanicalZeroValid = preferences.getBool("mzv", false);
 }
 
 
@@ -369,13 +415,17 @@ void saveParameters() {
   preferences.putFloat("yad", yAngKd);
   preferences.putFloat("vkx", visionKx);
   preferences.putFloat("vky", visionKy);
+
+  preferences.putFloat("mzx", mechanicalZeroX);
+  preferences.putFloat("mzy", mechanicalZeroY);
+  preferences.putBool("mzv", mechanicalZeroValid);
 }
 
 // ============================================================================
-// resetParameters()：恢复代码默认值
+// resetParameters()：恢复PID和视觉参数的代码默认值
 //
 // 先把运行变量恢复为宏定义的默认参数，再调用saveParameters写入Flash。
-// 因此复位后重新上电仍会保持这些默认值。
+// 机械零点属于安装校准结果，不随普通参数复位而清除。
 // ============================================================================
 void resetParameters() {
   xAngKp = ANGKP_X;
@@ -549,7 +599,7 @@ void receiveUdpCommand() {
     }
   }
 
-  // RESET,1：恢复全部默认参数并保存。
+  // RESET,1：恢复PID和视觉默认参数并保存，保留机械零点。
   // 由于X、Y角度PID都恢复了默认值，所以两个PID刷新标志都要置true。
   else if (strcmp(name, "RESET") == 0) {
     if (value == 1.0f) {
@@ -557,6 +607,48 @@ void receiveUdpCommand() {
       updated = true;
       xAnglePidUpdated = true;
       yAnglePidUpdated = true;
+    }
+  }
+
+  else if (strcmp(name, "CAL") == 0) {
+    if (value == 1.0f) {
+      mechanicalCalibrationMode = true;
+      updated = true;
+    }
+  }
+
+  else if (strcmp(name, "ZERO") == 0) {
+    if (
+      value == 1.0f &&
+      mechanicalCalibrationMode
+    ) {
+      mechanicalZeroX = DFOC_X_RawAngle();
+      mechanicalZeroY = DFOC_Y_RawAngle();
+      mechanicalZeroValid = true;
+
+      DFOC_SET_MECHANICAL_ZERO(
+        mechanicalZeroX,
+        mechanicalZeroY
+      );
+
+      targetX = 0.0f;
+      targetY = 0.0f;
+
+      saveParameters();
+      mechanicalCalibrationMode = false;
+      command_received = false;
+      updated = true;
+    }
+  }
+
+  else if (strcmp(name, "CANCEL") == 0) {
+    if (value == 1.0f && mechanicalCalibrationMode) {
+      targetX = DFOC_X_Angle();
+      targetY = DFOC_Y_Angle();
+
+      mechanicalCalibrationMode = false;
+      command_received = false;
+      updated = true;
     }
   }
 

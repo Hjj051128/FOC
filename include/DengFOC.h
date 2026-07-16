@@ -62,10 +62,10 @@ void DFOC_M1_Vbus(float power_supply);
 String serialReceiveUserCommand();
 
 // 两个函数名字相同但参数不同，C++可以通过参数判断调用哪个函数，这叫“函数重载”。
-String serialReceiveUserCommandXY();
+bool serialReceiveUserCommandXY();
 
 // 从指定串口接收
-String serialReceiveUserCommandXY(Stream &port);
+bool serialReceiveUserCommandXY(Stream &port);
 
 // 返回最近一次串口接收到的目标值。
 float serial_motor_target();
@@ -77,6 +77,14 @@ float serial_motor_target_Y();
 // 获取X/Y轴累计机械角度，单位 rad。
 float DFOC_X_Angle();
 float DFOC_Y_Angle();
+
+// 获取X/Y轴当前单圈原始机械角度，已包含编码器方向。
+float DFOC_X_RawAngle();
+float DFOC_Y_RawAngle();
+
+// 设置或关闭用户机械零点。未设置时保持原来的累计角度行为。
+void DFOC_SET_MECHANICAL_ZERO(float zeroX, float zeroY);
+void DFOC_CLEAR_MECHANICAL_ZERO();
 
 // 获取X/Y轴速度，单位一般是 rad/s。
 float DFOC_X_Velocity();

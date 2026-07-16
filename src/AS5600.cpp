@@ -3,39 +3,47 @@
 #include <Arduino.h> 
 
 #define _2PI 6.28318530718f
-
+static constexpr uint8_t AS5600_ADDRESS = 0x36;
+static constexpr uint8_t AS5600_ANGLE_REG = 0x0C;
+static constexpr float AS5600_RAD_PER_COUNT = _2PI / 4096.0f;
 
 
 // AS5600 相关
-double Sensor_AS5600::getSensorAngle() {
-  uint8_t angle_reg_msb = 0x0C;
+float Sensor_AS5600::getSensorAngle()
+{
+  wire->beginTransmission(AS5600_ADDRESS);
+  wire->write(AS5600_ANGLE_REG);
 
-  byte readArray[2];
-  uint16_t readValue = 0;
-
-  wire->beginTransmission(0x36);
-  wire->write(angle_reg_msb);
-  wire->endTransmission(false);
-
-
-  wire->requestFrom(0x36, (uint8_t)2);
-  for (byte i=0; i < 2; i++) {
-    readArray[i] = wire->read();
+  // false表示发送寄存器地址后保持总线，用于重复起始读取。
+  if (wire->endTransmission(false) != 0) {
+    return angle_prev;
   }
-  int _bit_resolution=12;
-  int _bits_used_msb=11-7;
-  float cpr = pow(2, _bit_resolution);
-  int lsb_used = _bit_resolution - _bits_used_msb;
 
-  uint8_t lsb_mask = (uint8_t)( (2 << lsb_used) - 1 );
-  uint8_t msb_mask = (uint8_t)( (2 << _bits_used_msb) - 1 );
-  
-  readValue = ( readArray[1] &  lsb_mask );
-  readValue += ( ( readArray[0] & msb_mask ) << lsb_used );
-  return (readValue/ (float)cpr) * _2PI; 
+  size_t received = wire->requestFrom(
+    AS5600_ADDRESS,
+    static_cast<uint8_t>(2)
+  );
 
+  if (received != 2 || wire->available() < 2) {
+    // 清掉可能残留的不完整数据。
+    while (wire->available()) {
+      wire->read();
+    }
+
+    // 通信失败时保持上一帧，避免错误角度让电机突然跳动。
+    return angle_prev;
+  }
+
+  uint8_t msb = static_cast<uint8_t>(wire->read());
+  uint8_t lsb = static_cast<uint8_t>(wire->read());
+
+  // AS5600角度值为12位：高寄存器低4位 + 低寄存器8位。
+  uint16_t rawAngle =
+    (static_cast<uint16_t>(msb & 0x0F) << 8) |
+    lsb;
+
+  return rawAngle * AS5600_RAD_PER_COUNT;
 }
-
 //AS5600 相关
 
 //=========角度处理相关=============
@@ -44,8 +52,7 @@ Sensor_AS5600::Sensor_AS5600(int Mot_Num) {
    
 }
 void Sensor_AS5600::Sensor_init(TwoWire* _wire) {
-    wire=_wire;
-    wire->begin();   //电机Sensor
+    wire = _wire;
     delay(500);
     getSensorAngle(); 
     delayMicroseconds(1);

@@ -26,6 +26,25 @@ int pwmAY = 10;              // Y轴A相PWM引脚
 int pwmBY = 11;              // Y轴B相PWM引脚
 int pwmCY = 12;              // Y轴C相PWM引脚
 
+// 用户定义的机械零点。默认关闭，避免改变现有工程的角度行为。
+static float mechanical_zero_X = 0.0f;
+static float mechanical_zero_Y = 0.0f;
+static bool mechanical_zero_enabled = false;
+
+// 云台只在 +/-PI 范围内运动，把跨越AS5600零点后的角度保持连续。
+static float normalizeMechanicalAngle(float angle)
+{
+  while (angle > PI) {
+    angle -= 2.0f * PI;
+  }
+
+  while (angle < -PI) {
+    angle += 2.0f * PI;
+  }
+
+  return angle;
+}
+
 // 速度低通滤波器。Tf=0.01 表示时间常数约10ms，能减小速度噪声。
 LowPassFilter vel_filter_X = LowPassFilter(0.01f);
 LowPassFilter vel_filter_Y = LowPassFilter(0.01f);
@@ -247,15 +266,51 @@ void DFOC_alignSensor(int _PP, int _DIR)
   DFOC_X_alignSensor(_PP, _DIR);
 }
 
-// 获取X轴累计机械角度，单位 rad。可能超过 0~2PI，因为它包含累计圈数。
+float DFOC_X_RawAngle()
+{
+  return sensor_dir_X * sensorX.getMechanicalAngle();
+}
+
+float DFOC_Y_RawAngle()
+{
+  return sensor_dir_Y * sensorY.getMechanicalAngle();
+}
+
+void DFOC_SET_MECHANICAL_ZERO(float zeroX, float zeroY)
+{
+  mechanical_zero_X = zeroX;
+  mechanical_zero_Y = zeroY;
+  mechanical_zero_enabled = true;
+}
+
+void DFOC_CLEAR_MECHANICAL_ZERO()
+{
+  mechanical_zero_X = 0.0f;
+  mechanical_zero_Y = 0.0f;
+  mechanical_zero_enabled = false;
+}
+
+// 获取X轴机械角度。启用机械零点后返回相对角度，否则保持旧行为。
 float DFOC_X_Angle()
 {
+  if (mechanical_zero_enabled) {
+    return normalizeMechanicalAngle(
+      DFOC_X_RawAngle() - mechanical_zero_X
+    );
+  }
+
   return sensor_dir_X * sensorX.getAngle();
 }
 
-// 获取Y轴累计机械角度，单位 rad。
+// 获取Y轴机械角度。启用机械零点后返回相对角度，否则保持旧行为。
 float DFOC_Y_Angle()
 {
+  if (mechanical_zero_enabled) {
+    return normalizeMechanicalAngle(
+      DFOC_Y_RawAngle() - mechanical_zero_Y
+    );
+  }
+
   return sensor_dir_Y * sensorY.getAngle();
 }
 
@@ -406,53 +461,70 @@ String serialReceiveUserCommand()
   return "";
 }
 
-String serialReceiveUserCommandXY(Stream &port)
+bool serialReceiveUserCommandXY(Stream &port)
 {
-  static String received_chars = "";
-  String command = "";
+  static char buffer[64];
+  static size_t length = 0;
+  static bool overflow = false;
+  bool valid_frame = false;
 
   while (port.available()) {
-    char inChar = (char)port.read();
+    char inChar = static_cast<char>(port.read());
 
-    // 忽略Windows发送的回车符
     if (inChar == '\r') {
       continue;
     }
 
-    // 收到换行符，说明一帧数据接收完成
     if (inChar == '\n') {
-      command = received_chars;
-      received_chars = "";
+      if (!overflow && length > 0) {
+        buffer[length] = '\0';
 
-      int comma_position = command.indexOf(',');
+        float target_x = 0.0f;
+        float target_y = 0.0f;
+        char extra = '\0';
 
-      // 格式必须是：数值,数值
-      if (comma_position > 0 &&
-          comma_position < command.length() - 1) {
+        int count = sscanf(
+          buffer,
+          " %f , %f %c",
+          &target_x,
+          &target_y,
+          &extra
+        );
 
-        String x_text =
-            command.substring(0, comma_position);
-
-        String y_text =
-            command.substring(comma_position + 1);
-
-        motor_target_X = x_text.toFloat();
-        motor_target_Y = y_text.toFloat();
+        if (
+          count == 2 &&
+          isfinite(target_x) &&
+          isfinite(target_y)
+        ) {
+          motor_target_X = target_x;
+          motor_target_Y = target_y;
+          valid_frame = true;
+        }
       }
+
+      length = 0;
+      overflow = false;
+      continue;
+    }
+
+    if (overflow) {
+      continue;
+    }
+
+    if (length < sizeof(buffer) - 1) {
+      buffer[length++] = inChar;
     }
     else {
-      // 还没有收到换行符，继续保存字符
-      received_chars += inChar;
+      length = 0;
+      overflow = true;
     }
   }
 
-  return command;
+  return valid_frame;
 }
 
-// 兼容函数
-String serialReceiveUserCommandXY()
+bool serialReceiveUserCommandXY()
 {
-  // 没传串口对象时，默认仍然读取USB串口
   return serialReceiveUserCommandXY(Serial);
 }
 

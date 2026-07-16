@@ -1,3 +1,5 @@
+#pragma once
+
 #include <Arduino.h> 
 #include "Wire.h"
 
@@ -10,7 +12,7 @@ class Sensor_AS5600
     float getAngle();
     float getVelocity();
     float getMechanicalAngle();
-    double getSensorAngle();
+    float getSensorAngle();
   private:
     int _Mot_Num;
     //AS5600 变量定义
