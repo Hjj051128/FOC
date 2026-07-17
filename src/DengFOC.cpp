@@ -45,16 +45,34 @@ static float normalizeMechanicalAngle(float angle)
   return angle;
 }
 
-// 速度低通滤波器。Tf=0.01 表示时间常数约10ms，能减小速度噪声。
+// 速度缓存低通滤波器：X轴20ms，Y轴10ms。
 LowPassFilter vel_filter_X = LowPassFilter(0.01f);
 LowPassFilter vel_filter_Y = LowPassFilter(0.01f);
+
+// 角度PID的D支路滤波时间常数。5ms约对应31.8Hz截止频率。
+static constexpr float ANGLE_D_FILTER_TF_X = 0.005f;
+static constexpr float ANGLE_D_FILTER_TF_Y = 0.005f;
 
 // X/Y各自独立的PID控制器。
 // angle_loop 输出给速度环，vel_loop 输出给FOC的Uq电压。
 PIDController vel_loop_X(2, 0, 0, 100000, 0);
-PIDController angle_loop_X(2, 0, 0, 100000, 100);
+PIDController angle_loop_X(
+  2,
+  0,
+  0,
+  100000,
+  100,
+  ANGLE_D_FILTER_TF_X
+);
 PIDController vel_loop_Y(2, 0, 0, 100000, 0);
-PIDController angle_loop_Y(2, 0, 0, 100000, 100);
+PIDController angle_loop_Y(
+  2,
+  0,
+  0,
+  100000,
+  100,
+  ANGLE_D_FILTER_TF_Y
+);
 
 // X轴AS5600：I2C0，当前接线 SDA=GPIO8，SCL=GPIO9。
 Sensor_AS5600 sensorX = Sensor_AS5600(0);

@@ -746,6 +746,45 @@ void receiveUdpCommand() {
     }
   }
 
+  // TX：设置X轴目标角度，单位rad。
+  else if (strcmp(name, "TX") == 0) {
+    if (
+      !mechanicalCalibrationMode &&
+      value >= X_ANGLE_MIN &&
+      value <= X_ANGLE_MAX
+    ) {
+      targetX = value;
+      command_received = false;
+      updated = true;
+    }
+  }
+
+  // TY：设置Y轴目标角度，单位rad。
+  else if (strcmp(name, "TY") == 0) {
+    if (
+      !mechanicalCalibrationMode &&
+      value >= Y_ANGLE_MIN &&
+      value <= Y_ANGLE_MAX
+    ) {
+      targetY = value;
+      command_received = false;
+      updated = true;
+    }
+  }
+
+  // HOME,1：两个轴回到机械零点。
+  else if (strcmp(name, "HOME") == 0) {
+    if (
+      value == 1.0f &&
+      !mechanicalCalibrationMode
+    ) {
+      targetX = 0.0f;
+      targetY = 0.0f;
+      command_received = false;
+      updated = true;
+    }
+  }
+
   // SAVE,1：将当前全部参数写入Flash。
   // 这里要求value严格等于1.0f，因为VOFA发送的是简单控制命令。
   else if (strcmp(name, "SAVE") == 0) {
