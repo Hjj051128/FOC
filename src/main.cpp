@@ -78,7 +78,6 @@
 #define Y_ANGLE_MIN  -1.5f
 #define Y_ANGLE_MAX  1.5f
 
-
 // ============================== 视觉追踪参数 ==============================
 #define VISION_KX            0.002f  // x轴像素误差转换到速度的比例
 #define VISION_KY            0.002f  // y轴像素误差转换到速度的比例
@@ -163,12 +162,14 @@ WiFiUDP udp;
 // ============================== UDP调参端口 ==============================
 const uint16_t udpPort = 1346;
 
+IPAddress vofaTelemetryIp(192, 168, 4, 255);     // 广播发送
+uint16_t vofaTelemetryPort = 1347;               // VOFA端口
+const uint32_t VOFA_TELEMETRY_INTERVAL_MS = 20;  // 50Hz
+
 
 // ============================== 函数提前声明 ==============================
-// UDP调参和参数存储相关函数。
-
-// 本地接收
 void receiveUdpCommand();  // 检查并解析一条VOFA命令
+void sendVofaData();       // 以固定频率回传两轴状态
 void loadParameters();     // 开机时从Flash读取参数
 void saveParameters();     // 把当前参数写入Flash
 void resetParameters();    // 恢复PID和视觉默认值并写入Flash
@@ -183,7 +184,8 @@ void setup() {
   // 读取模式
   pinMode(DEBUG_PIN, INPUT_PULLUP);
   delay(30);  // 按键消抖
-
+ 
+  // 判断是否是调试模式
   DebugMode = !digitalRead(DEBUG_PIN);
 
   // 用外接LED显示本次上电选择的工作模式。
@@ -193,7 +195,7 @@ void setup() {
   // 打开名为“gimbal”的NVS命名空间。
   // false 表示以“可读可写”方式打开；若为 true 则仅允许读取。
   preferences.begin("gimbal", false);
-  loadParameters();
+  loadParameters();  // 开机时从Flash读取参数
 
   // 使能电机引脚 
   pinMode(EN_X, OUTPUT);
@@ -210,11 +212,11 @@ void setup() {
      17           // TX脚
     );         
 
-  DFOC_X_Vbus(12.0f);
+  DFOC_X_Vbus(12.0f);  // X轴总线电压
   DFOC_X_alignSensor(MOTOR_PP_X, SENSOR_DIR_X); // 随后进行编码器与电机电角度的对齐。
 
-  DFOC_Y_Vbus(12.0f);
-  DFOC_Y_alignSensor(MOTOR_PP_Y, SENSOR_DIR_Y);
+  DFOC_Y_Vbus(12.0f);  // Y轴总线电压
+  DFOC_Y_alignSensor(MOTOR_PP_Y, SENSOR_DIR_Y); // 随后进行编码器与电机电角度的对齐
 
   // 只有完成过机械零点校准时才启用，首次上电保持原来的累计角度行为。
   if (mechanicalZeroValid) {
@@ -227,20 +229,19 @@ void setup() {
     DFOC_CLEAR_MECHANICAL_ZERO();
   }
 
+
+  DFOC_X_SET_ANGLE_PID(xAngKp, xAngKi, xAngKd, 100000);  // X角度环PID
+  DFOC_X_SET_VEL_PID(xSpeedKp, xSpeedKi, xSpeedKd, 0);   // X速度环PID
+
   DFOC_Y_SET_ANGLE_PID(yAngKp, yAngKi, yAngKd, 100000);
   DFOC_Y_SET_VEL_PID(ySpeedKp, ySpeedKi, ySpeedKd, 0);
-
-    // X角度环PID
-  DFOC_X_SET_ANGLE_PID(xAngKp, xAngKi, xAngKd, 100000);
-  // X速度环PID
-  DFOC_X_SET_VEL_PID(xSpeedKp, xSpeedKi, xSpeedKd, 0);
-
 
   // 初始化结束后先把两个轴的转矩指令设为0，
   DFOC_X_setTorque(0.0f);
   DFOC_Y_setTorque(0.0f);
 
 
+  // 调试模式下才创建热点
   if(DebugMode) {
     WiFi.mode(WIFI_AP);
     // 创建热点 ID 密码 
@@ -248,12 +249,10 @@ void setup() {
     // 监听本地端口传来的数据
     udp.begin(udpPort);
   }
-  
 }
 
 
-void loop()
-{
+void loop() {
 
   // 从UART1读取并解析视觉模块的一条完整命令。
   bool visionFrameReceived = serialReceiveUserCommandXY(VisionSerial);
@@ -261,6 +260,7 @@ void loop()
 
   // 只有视觉数据更新时，才重新计算一次视觉目标角度。
   // 如果本轮没有新视觉帧，targetX和targetY保持原值，
+  // 只有不是机械零点定位模式下才使用
   if(visionFrameReceived && !mechanicalCalibrationMode) {
 
     // millis()返回系统启动后的毫秒数，类型为unsigned long。
@@ -284,7 +284,6 @@ void loop()
       visionErroeY = 0.0f;
     }
 
-
     // 视觉比例控制：
     float trackSpeedX = visionKx * VISION_DIR_X * visionErroeX;
     float trackSpeedY = visionKy * VISION_DIR_Y * visionErroeY;
@@ -292,7 +291,6 @@ void loop()
     // 速度限幅
     trackSpeedX = constrain(trackSpeedX, -MAX_TRACK_SPEED_X, MAX_TRACK_SPEED_X);
     trackSpeedY = constrain(trackSpeedY, -MAX_TRACK_SPEED_Y, MAX_TRACK_SPEED_Y);
-    
 
     // 离散积分：
     targetX += trackSpeedX * dt;
@@ -321,6 +319,7 @@ void loop()
   // 即使视觉暂时没有新数据，电机也要继续保持上一次目标角度。
   // 函数名中 Velocity_Angle 表示库内部采用速度环+角度环串级控制。
   // 不管有没有数据电机闭环必须持续运行
+  // 非机械零点定位模式下进行
   if (mechanicalCalibrationMode) {
     DFOC_X_setTorque(0.0f);
     DFOC_Y_setTorque(0.0f);
@@ -331,8 +330,64 @@ void loop()
   }
 
   // 电机控制优先完成，再非阻塞检查UDP调参命令。
+  // 调试模式下进行接收命令以及回传电机状态
   if(DebugMode) {
     receiveUdpCommand();
+    sendVofaData();
+  }
+}
+
+
+// ============================================================================
+// sendVofaData()：以FireWater文本格式回传两轴状态
+//
+// 通道顺序：
+// targetX, angleX, errorX, velocityX,
+// targetY, angleY, errorY, velocityY
+//
+// 角度和速度读取的是FOC本轮已经更新的AS5600缓存，不会增加I2C访问。
+// 固定50Hz发送，避免每次高速控制循环都进行字符串格式化和UDP发送。
+// ============================================================================
+void sendVofaData() {
+  static uint32_t lastSendMs = 0;
+
+  // 控制频率
+  uint32_t nowMs = millis();
+  if (nowMs - lastSendMs < VOFA_TELEMETRY_INTERVAL_MS) {
+    return;
+  }
+  lastSendMs = nowMs;
+
+  float angleX = DFOC_X_Angle();
+  float angleY = DFOC_Y_Angle();
+  float velocityX = DFOC_X_Velocity();
+  float velocityY = DFOC_Y_Velocity();
+
+  char packet[160];
+  int length = snprintf(
+    packet,
+    sizeof(packet),
+    "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+    targetX,
+    angleX,
+    targetX - angleX,
+    velocityX,
+    targetY,
+    angleY,
+    targetY - angleY,
+    velocityY
+  );
+
+  if (length <= 0 || length >= static_cast<int>(sizeof(packet))) {
+    return;
+  }
+
+  if (udp.beginPacket(vofaTelemetryIp, vofaTelemetryPort)) {
+    udp.write(
+      reinterpret_cast<const uint8_t *>(packet),
+      static_cast<size_t>(length)
+    );
+    udp.endPacket();
   }
 }
 
@@ -515,6 +570,10 @@ void receiveUdpCommand() {
   if (packetSize <= 0) {
     return;
   }
+
+  // 后续遥测直接回传给最近一次发送命令的VOFA客户端。
+  vofaTelemetryIp = udp.remoteIP();
+  vofaTelemetryPort = udp.remotePort();
 
   // 定义缓冲区
   char buffer[64];
