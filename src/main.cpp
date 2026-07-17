@@ -33,7 +33,6 @@
 #define SPEEDKI_Y     0.0f
 #define SPEEDKD_Y     0.0f
 
-
 // ============================== WiFi调参安全范围 ==============================
 // VOFA 通过 UDP 修改参数时，程序会检查新数值是否位于这些范围内。
 // WiFi调参范围，X/Y角度环共用
@@ -44,6 +43,15 @@
 #define ANGKD_MIN     0.0f
 #define ANGKD_MAX     1.0f
 
+// WiFi调参范围，X/Y速度环共用。
+// 当前速度环输出最终受到Uq电压限幅保护，这里仍使用较保守的调参范围。
+#define SPEEDKP_MIN   0.0f
+#define SPEEDKP_MAX   0.1f
+#define SPEEDKI_MIN   0.0f
+#define SPEEDKI_MAX   1.0f
+#define SPEEDKD_MIN   0.0f
+#define SPEEDKD_MAX   0.1f
+
 
 // visionKx、visionKy 用来把“视觉像素误差”换算成“目标角速度”。
 // 这里限定 WiFi 在线调节时允许输入的最小值和最大值。
@@ -53,7 +61,7 @@
 
 
 // ============================== 编码器方向 ==============================
-#define SENSOR_DIR_X  -1
+#define SENSOR_DIR_X  1
 #define SENSOR_DIR_Y  -1
 
 
@@ -80,13 +88,13 @@
 #define VISION_DIR_X         1.0     // X轴视觉误差方向
 #define VISION_DIR_Y         1.0     // Y轴视觉误差方向
 
-#define DEBUG_PIN   18  // 调试引脚
+#define DEBUG_PIN       2   // 上电模式选择引脚，低电平进入WiFi调试模式
+#define DEBUG_LED_PIN   21  // 外接LED：普通模式低电平，WiFi调试模式高电平
 
 #define MECHANICAL_ZERO_MIN  (-2.0f * PI)
 #define MECHANICAL_ZERO_MAX  ( 2.0f * PI)
 
 bool DebugMode = false;  // 调试模式
-
 
 // ============================== 可运行时修改的参数变量 ==============================
 // 宏定义本身不能在程序运行过程中改变，所以另外建立 float 变量。
@@ -98,6 +106,14 @@ float xAngKd = ANGKD_X;
 float yAngKp = ANGKP_Y;
 float yAngKi = ANGKI_Y;
 float yAngKd = ANGKD_Y;
+
+float xSpeedKp = SPEEDKP_X;
+float xSpeedKi = SPEEDKI_X;
+float xSpeedKd = SPEEDKD_X;
+
+float ySpeedKp = SPEEDKP_Y;
+float ySpeedKi = SPEEDKI_Y;
+float ySpeedKd = SPEEDKD_Y;
 
 float visionKx = VISION_KX;
 float visionKy = VISION_KY;
@@ -168,7 +184,11 @@ void setup() {
   pinMode(DEBUG_PIN, INPUT_PULLUP);
   delay(30);  // 按键消抖
 
-  DebugMode = digitalRead(DEBUG_PIN) == LOW;
+  DebugMode = !digitalRead(DEBUG_PIN);
+
+  // 用外接LED显示本次上电选择的工作模式。
+  pinMode(DEBUG_LED_PIN, OUTPUT);
+  digitalWrite(DEBUG_LED_PIN, DebugMode ? HIGH : LOW);
 
   // 打开名为“gimbal”的NVS命名空间。
   // false 表示以“可读可写”方式打开；若为 true 则仅允许读取。
@@ -208,12 +228,12 @@ void setup() {
   }
 
   DFOC_Y_SET_ANGLE_PID(yAngKp, yAngKi, yAngKd, 100000);
-  DFOC_Y_SET_VEL_PID(SPEEDKP_Y, SPEEDKI_Y, SPEEDKD_Y, 0);
+  DFOC_Y_SET_VEL_PID(ySpeedKp, ySpeedKi, ySpeedKd, 0);
 
     // X角度环PID
   DFOC_X_SET_ANGLE_PID(xAngKp, xAngKi, xAngKd, 100000);
   // X速度环PID
-  DFOC_X_SET_VEL_PID(SPEEDKP_X, SPEEDKI_X, SPEEDKD_X, 0);
+  DFOC_X_SET_VEL_PID(xSpeedKp, xSpeedKi, xSpeedKd, 0);
 
 
   // 初始化结束后先把两个轴的转矩指令设为0，
@@ -355,6 +375,8 @@ float loadFloatInRange(
 // Flash键名采用短字符串，是为了节省NVS空间：
 // xap/xai/xad：X轴角度环Kp/Ki/Kd
 // yap/yai/yad：Y轴角度环Kp/Ki/Kd
+// xvp/xvi/xvd：X轴速度环Kp/Ki/Kd
+// yvp/yvi/yvd：Y轴速度环Kp/Ki/Kd
 // vkx/vky：视觉X/Y比例系数
 // ============================================================================
 void loadParameters() {
@@ -367,6 +389,14 @@ void loadParameters() {
   yAngKp = loadFloatInRange("yap", ANGKP_Y, ANGKP_MIN, ANGKP_MAX);
   yAngKi = loadFloatInRange("yai", ANGKI_Y, ANGKI_MIN, ANGKI_MAX);
   yAngKd = loadFloatInRange("yad", ANGKD_Y, ANGKD_MIN, ANGKD_MAX);
+
+  xSpeedKp = loadFloatInRange("xvp", SPEEDKP_X, SPEEDKP_MIN, SPEEDKP_MAX);
+  xSpeedKi = loadFloatInRange("xvi", SPEEDKI_X, SPEEDKI_MIN, SPEEDKI_MAX);
+  xSpeedKd = loadFloatInRange("xvd", SPEEDKD_X, SPEEDKD_MIN, SPEEDKD_MAX);
+
+  ySpeedKp = loadFloatInRange("yvp", SPEEDKP_Y, SPEEDKP_MIN, SPEEDKP_MAX);
+  ySpeedKi = loadFloatInRange("yvi", SPEEDKI_Y, SPEEDKI_MIN, SPEEDKI_MAX);
+  ySpeedKd = loadFloatInRange("yvd", SPEEDKD_Y, SPEEDKD_MIN, SPEEDKD_MAX);
 
   visionKx = loadFloatInRange(
     "vkx",
@@ -413,6 +443,12 @@ void saveParameters() {
   preferences.putFloat("yap", yAngKp);
   preferences.putFloat("yai", yAngKi);
   preferences.putFloat("yad", yAngKd);
+  preferences.putFloat("xvp", xSpeedKp);
+  preferences.putFloat("xvi", xSpeedKi);
+  preferences.putFloat("xvd", xSpeedKd);
+  preferences.putFloat("yvp", ySpeedKp);
+  preferences.putFloat("yvi", ySpeedKi);
+  preferences.putFloat("yvd", ySpeedKd);
   preferences.putFloat("vkx", visionKx);
   preferences.putFloat("vky", visionKy);
 
@@ -434,6 +470,12 @@ void resetParameters() {
   yAngKp = ANGKP_Y;
   yAngKi = ANGKI_Y;
   yAngKd = ANGKD_Y;
+  xSpeedKp = SPEEDKP_X;
+  xSpeedKi = SPEEDKI_X;
+  xSpeedKd = SPEEDKD_X;
+  ySpeedKp = SPEEDKP_Y;
+  ySpeedKi = SPEEDKI_Y;
+  ySpeedKd = SPEEDKD_Y;
   visionKx = VISION_KX;
   visionKy = VISION_KY;
 
@@ -452,6 +494,10 @@ void resetParameters() {
 // XAI,0.01     修改X轴角度环Ki
 // XAD,0.0      修改X轴角度环Kd
 // YAP,2.5      修改Y轴角度环Kp
+// XVP,0.006    修改X轴速度环Kp
+// XVI,0.0      修改X轴速度环Ki
+// XVD,0.0      修改X轴速度环Kd
+// YVP,0.006    修改Y轴速度环Kp
 // VKX,0.0025   修改X轴视觉比例
 // SAVE,1       把当前参数写入Flash
 // RESET,1      恢复默认参数并写入Flash
@@ -514,6 +560,8 @@ void receiveUdpCommand() {
   bool updated = false;
   bool xAnglePidUpdated = false;
   bool yAnglePidUpdated = false;
+  bool xVelocityPidUpdated = false;
+  bool yVelocityPidUpdated = false;
 
 
   // strcmp比较两个C字符串是否完全相同。
@@ -573,6 +621,56 @@ void receiveUdpCommand() {
     }
   }
 
+  // XVP/XVI/XVD：X轴速度环Kp/Ki/Kd。
+  else if (strcmp(name, "XVP") == 0) {
+    if (value >= SPEEDKP_MIN && value <= SPEEDKP_MAX) {
+      xSpeedKp = value;
+      updated = true;
+      xVelocityPidUpdated = true;
+    }
+  }
+
+  else if (strcmp(name, "XVI") == 0) {
+    if (value >= SPEEDKI_MIN && value <= SPEEDKI_MAX) {
+      xSpeedKi = value;
+      updated = true;
+      xVelocityPidUpdated = true;
+    }
+  }
+
+  else if (strcmp(name, "XVD") == 0) {
+    if (value >= SPEEDKD_MIN && value <= SPEEDKD_MAX) {
+      xSpeedKd = value;
+      updated = true;
+      xVelocityPidUpdated = true;
+    }
+  }
+
+  // YVP/YVI/YVD：Y轴速度环Kp/Ki/Kd。
+  else if (strcmp(name, "YVP") == 0) {
+    if (value >= SPEEDKP_MIN && value <= SPEEDKP_MAX) {
+      ySpeedKp = value;
+      updated = true;
+      yVelocityPidUpdated = true;
+    }
+  }
+
+  else if (strcmp(name, "YVI") == 0) {
+    if (value >= SPEEDKI_MIN && value <= SPEEDKI_MAX) {
+      ySpeedKi = value;
+      updated = true;
+      yVelocityPidUpdated = true;
+    }
+  }
+
+  else if (strcmp(name, "YVD") == 0) {
+    if (value >= SPEEDKD_MIN && value <= SPEEDKD_MAX) {
+      ySpeedKd = value;
+      updated = true;
+      yVelocityPidUpdated = true;
+    }
+  }
+
   // VKX：视觉X轴像素误差到目标角速度的比例系数。
   // 它不属于电机内部角度PID，所以修改后无需调用DFOC_X_SET_ANGLE_PID。
   else if (strcmp(name, "VKX") == 0) {
@@ -607,6 +705,8 @@ void receiveUdpCommand() {
       updated = true;
       xAnglePidUpdated = true;
       yAnglePidUpdated = true;
+      xVelocityPidUpdated = true;
+      yVelocityPidUpdated = true;
     }
   }
 
@@ -677,6 +777,25 @@ void receiveUdpCommand() {
       yAngKi,
       yAngKd,
       100000
+    );
+  }
+
+  // 速度环参数变化后立即刷新对应轴的速度PID。
+  if (xVelocityPidUpdated) {
+    DFOC_X_SET_VEL_PID(
+      xSpeedKp,
+      xSpeedKi,
+      xSpeedKd,
+      0
+    );
+  }
+
+  if (yVelocityPidUpdated) {
+    DFOC_Y_SET_VEL_PID(
+      ySpeedKp,
+      ySpeedKi,
+      ySpeedKd,
+      0
     );
   }
 }
