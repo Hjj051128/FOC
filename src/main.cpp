@@ -229,7 +229,6 @@ void setup() {
     DFOC_CLEAR_MECHANICAL_ZERO();
   }
 
-
   DFOC_X_SET_ANGLE_PID(xAngKp, xAngKi, xAngKd, 100000);  // X角度环PID
   DFOC_X_SET_VEL_PID(xSpeedKp, xSpeedKi, xSpeedKd, 0);   // X速度环PID
 
