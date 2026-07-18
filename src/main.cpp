@@ -1,5 +1,6 @@
 ﻿#include <Arduino.h>
 #include "DengFOC.h"
+#include "predictive_vision_tracker.h"
 #include "vision_protocol.h"
 #include "WiFi.h"
 #include "WiFiUdp.h"
@@ -53,12 +54,15 @@
 #define SPEEDKD_MIN   0.0f
 #define SPEEDKD_MAX   0.1f
 
-
 // visionKx、visionKy 用来把“视觉像素误差”换算成“目标角速度”。
 // 这里限定 WiFi 在线调节时允许输入的最小值和最大值。
 // WiFi视觉跟踪比例调参范围
 #define VISION_K_MIN  0.0f
 #define VISION_K_MAX  0.1f
+#define VISION_KI_MIN 0.0f
+#define VISION_KI_MAX 0.02f
+#define VISION_KD_MIN 0.0f
+#define VISION_KD_MAX 0.002f
 
 
 // ============================== 编码器方向 ==============================
@@ -82,13 +86,32 @@
 // ============================== 视觉追踪参数 ==============================
 #define VISION_KX            0.002f  // x轴像素误差转换到速度的比例
 #define VISION_KY            0.002f  // y轴像素误差转换到速度的比例
-#define MAX_TRACK_SPEED_X    0.6f    // x轴跟踪最大速度
-#define MAX_TRACK_SPEED_Y    0.6f    // y轴跟踪最大速度
+#define VISION_KI_X          0.0f    // X轴视觉积分，调试时从0开始
+#define VISION_KD_X          0.0f    // X轴视觉微分，调试时从0开始
+#define VISION_KI_Y          0.0f
+#define VISION_KD_Y          0.0f
+#define MAX_TRACK_SPEED_X    1.2f    // x轴跟踪最大速度
+#define MAX_TRACK_SPEED_Y    1.2f    // y轴跟踪最大速度
 #define VISION_DEAD_ZONE     5.0f    // 中心死区像素
-#define VISION_CONFIDENCE_MIN 70     // 低于该置信度的目标不参与追踪
-#define VISION_LOST_TIMEOUT_MS 200   // 超时后按丢失目标处理
+#define VISION_CONFIDENCE_MIN 40     // 低于该置信度的目标不参与追踪
+#define VISION_LOST_TIMEOUT_MS 500   // 超时后按丢失目标处理
 #define VISION_DIR_X         1.0     // X轴视觉误差方向
 #define VISION_DIR_Y         1.0     // Y轴视觉误差方向
+
+// 1：使用预测式视觉追踪；0：恢复原来的逐帧比例追踪。
+#ifndef USE_PREDICTIVE_VISION_TRACKER
+#define USE_PREDICTIVE_VISION_TRACKER  1
+#endif
+
+// 观测器滤除坐标噪声并估计目标像素速度，预测时间用于补偿总延时。
+#define ADVANCED_VISION_DEAD_ZONE       0.5f
+#define VISION_OBSERVER_BANDWIDTH_HZ    6.0f
+#define VISION_PREDICTION_TIME_S        0.06f
+#define VISION_MAX_PREDICTION_TIME_S    0.12f
+#define VISION_MAX_PIXEL_SPEED          4000.0f
+#define VISION_COMMAND_HOLD_MS           100
+#define VISION_PID_INTEGRAL_ZONE        40.0f
+#define VISION_PID_INTEGRAL_SPEED_LIMIT 0.2f
 
 #define DEBUG_PIN       2   // 上电模式选择引脚，低电平进入WiFi调试模式
 #define DEBUG_LED_PIN   21  // 外接LED：普通模式低电平，WiFi调试模式高电平
@@ -123,6 +146,10 @@ float ySpeedKd = SPEEDKD_Y;
 
 float visionKx = VISION_KX;
 float visionKy = VISION_KY;
+float visionKiX = VISION_KI_X;
+float visionKdX = VISION_KD_X;
+float visionKiY = VISION_KI_Y;
+float visionKdY = VISION_KD_Y;
 
 // 机械零点
 float mechanicalZeroX = 0.0f;
@@ -144,8 +171,8 @@ int EN_Y = 13;
 
 
 // ============================== 当前目标角度 ==============================
-// targetX、targetY 是电机角度环最终要追踪的目标值，单位通常为弧度。
-// 视觉每来一帧数据，就给它们增加一小段“角度增量”。
+// targetX、targetY 是电机角度环最终要追踪的目标值，单位为弧度。
+// 高级模式连续更新目标，旧模式在收到视觉帧时更新。
 float targetX = 0.0f;
 float targetY = 0.0f;
 
@@ -185,6 +212,14 @@ void resetParameters();    // 恢复PID和视觉默认值并写入Flash
 // 创建串口对象
 HardwareSerial VisionSerial(1);   // (1) 表示绑定ESP32的UART1控制器
 VisionPacketParser visionParser;
+PredictiveVisionTracker predictiveVisionTracker(
+  VISION_OBSERVER_BANDWIDTH_HZ,
+  VISION_PREDICTION_TIME_S,
+  VISION_MAX_PREDICTION_TIME_S,
+  VISION_MAX_PIXEL_SPEED,
+  VISION_COMMAND_HOLD_MS,
+  VISION_LOST_TIMEOUT_MS
+);
 
 // 保存最近一帧视觉状态，供50Hz VOFA遥测使用。
 int16_t visionDeltaX = 0;
@@ -276,10 +311,11 @@ void setup() {
 void loop() {
 
   // 从UART1读取并校验最新的11字节二进制视觉帧。
+  uint32_t nowUs = micros();
+  unsigned long now = millis();
   VisionFrame visionFrame = {};
   bool visionFrameReceived =
     visionParser.poll(VisionSerial, visionFrame);
-  unsigned long now = millis();
 
   if (visionFrameReceived) {
     visionDeltaX = visionFrame.delta_x;
@@ -290,35 +326,35 @@ void loop() {
   bool visionFrameAccepted =
     visionFrameReceived &&
     visionFrame.target_found &&
-    visionFrame.confidence >= VISION_CONFIDENCE_MIN;
-
-  if (visionFrameReceived) {
-    visionTrackingValid = visionFrameAccepted;
-  }
+    visionFrame.confidence >= VISION_CONFIDENCE_MIN &&
+    !mechanicalCalibrationMode;
 
   // 收到丢目标/低置信度帧，或超过200ms没有有效帧时停止更新目标。
   if (
     (visionFrameReceived && !visionFrameAccepted) ||
     (
-      command_received &&
+      visionTrackingValid &&
       now - last_command_ms > VISION_LOST_TIMEOUT_MS
     )
   ) {
     command_received = false;
     visionTrackingValid = false;
+#if USE_PREDICTIVE_VISION_TRACKER
+    predictiveVisionTracker.reset();
+#endif
   }
 
-
-  // 只有视觉数据更新时，才重新计算一次视觉目标角度。
-  // 如果本轮没有新视觉帧，targetX和targetY保持原值，
-  // 只有不是机械零点定位模式下才使用
-  if(visionFrameAccepted && !mechanicalCalibrationMode) {
-
-    // 计算两帧视觉数据是时间间隔，第一帧没有上一次时间所以加上条件语句判断是否是第一帧并且给默认数值
+  if (visionFrameAccepted) {
+#if USE_PREDICTIVE_VISION_TRACKER
+    // 新视觉帧只校正观测器，目标角度由下面的高速连续积分更新。
+    predictiveVisionTracker.update(
+      static_cast<float>(visionFrame.delta_x),
+      static_cast<float>(visionFrame.delta_y),
+      nowUs
+    );
+#else
+    // 旧算法保留用于回退和对比。
     float dt = command_received ? (now - last_command_ms) * 0.001f : 0.033f;
-   
-    // 太小会让角度增量接近0；太大会导致网络停顿后云台突然跳一大步。
-    // 防止dt过小通信停顿后突然变大
     dt = constrain(dt, 0.005f, 0.1f);
 
     float visionErrorX =
@@ -350,12 +386,53 @@ void loop() {
       Y_ANGLE_MIN,
       Y_ANGLE_MAX
     );
+#endif
 
-    // 保留本次视觉数据到达时间
     last_command_ms = now;
     command_received = true;
+    visionTrackingValid = true;
   }
 
+#if USE_PREDICTIVE_VISION_TRACKER
+  // 以主控制循环频率连续推进目标角度，避免低帧率造成阶梯式动作。
+  static uint32_t lastVisionControlUs = 0;
+  float visionControlDt = 0.0f;
+  if (lastVisionControlUs != 0) {
+    uint32_t elapsedUs = nowUs - lastVisionControlUs;
+    if (elapsedUs <= 20000U) {
+      visionControlDt = elapsedUs * 1e-6f;
+    }
+  }
+  lastVisionControlUs = nowUs;
+
+  bool visionControlActive =
+    command_received &&
+    visionTrackingValid &&
+    !mechanicalCalibrationMode;
+
+  PredictiveVisionOutput visionOutput =
+    predictiveVisionTracker.output(
+      nowUs,
+      visionControlActive,
+      VisionPidGains{visionKx, visionKiX, visionKdX},
+      VisionPidGains{visionKy, visionKiY, visionKdY},
+      VISION_DIR_X,
+      VISION_DIR_Y,
+      ADVANCED_VISION_DEAD_ZONE,
+      MAX_TRACK_SPEED_X,
+      MAX_TRACK_SPEED_Y,
+      VISION_PID_INTEGRAL_ZONE,
+      VISION_PID_INTEGRAL_SPEED_LIMIT
+    );
+
+  if (visionControlDt > 0.0f) {
+    targetX += visionOutput.speed_x * visionControlDt;
+    targetY += visionOutput.speed_y * visionControlDt;
+
+    targetX = constrain(targetX, X_ANGLE_MIN, X_ANGLE_MAX);
+    targetY = constrain(targetY, Y_ANGLE_MIN, Y_ANGLE_MAX);
+  }
+#endif
 
   // 电机闭环必须尽可能高频、连续调用。
   // 即使视觉暂时没有新数据，电机也要继续保持上一次目标角度。
@@ -509,6 +586,7 @@ float loadFloatInRange(
 // xvp/xvi/xvd：X轴速度环Kp/Ki/Kd
 // yvp/yvi/yvd：Y轴速度环Kp/Ki/Kd
 // vkx/vky：视觉X/Y比例系数
+// vix/vdx/viy/vdy：视觉X/Y积分与微分系数
 // ============================================================================
 void loadParameters() {
 
@@ -540,6 +618,30 @@ void loadParameters() {
     VISION_KY,
     VISION_K_MIN,
     VISION_K_MAX
+  );
+  visionKiX = loadFloatInRange(
+    "vix",
+    VISION_KI_X,
+    VISION_KI_MIN,
+    VISION_KI_MAX
+  );
+  visionKdX = loadFloatInRange(
+    "vdx",
+    VISION_KD_X,
+    VISION_KD_MIN,
+    VISION_KD_MAX
+  );
+  visionKiY = loadFloatInRange(
+    "viy",
+    VISION_KI_Y,
+    VISION_KI_MIN,
+    VISION_KI_MAX
+  );
+  visionKdY = loadFloatInRange(
+    "vdy",
+    VISION_KD_Y,
+    VISION_KD_MIN,
+    VISION_KD_MAX
   );
 
   mechanicalZeroX = loadFloatInRange(
@@ -582,6 +684,10 @@ void saveParameters() {
   preferences.putFloat("yvd", ySpeedKd);
   preferences.putFloat("vkx", visionKx);
   preferences.putFloat("vky", visionKy);
+  preferences.putFloat("vix", visionKiX);
+  preferences.putFloat("vdx", visionKdX);
+  preferences.putFloat("viy", visionKiY);
+  preferences.putFloat("vdy", visionKdY);
 
   preferences.putFloat("mzx", mechanicalZeroX);
   preferences.putFloat("mzy", mechanicalZeroY);
@@ -609,6 +715,10 @@ void resetParameters() {
   ySpeedKd = SPEEDKD_Y;
   visionKx = VISION_KX;
   visionKy = VISION_KY;
+  visionKiX = VISION_KI_X;
+  visionKdX = VISION_KD_X;
+  visionKiY = VISION_KI_Y;
+  visionKdY = VISION_KD_Y;
 
   saveParameters();
 }
@@ -628,7 +738,10 @@ void resetParameters() {
 // XVI,0.0      修改X轴速度环Ki
 // XVD,0.0      修改X轴速度环Kd
 // YVP,0.006    修改Y轴速度环Kp
-// VKX,0.0025   修改X轴视觉比例
+// VXP,0.006    修改X轴视觉P
+// VXI,0.0      修改X轴视觉I
+// VXD,0.0003   修改X轴视觉D
+// VYP/VYI/VYD  修改Y轴视觉PID
 // SAVE,1       把当前参数写入Flash
 // RESET,1      恢复默认参数并写入Flash
 //
@@ -805,19 +918,53 @@ void receiveUdpCommand() {
     }
   }
 
-  // VKX：视觉X轴像素误差到目标角速度的比例系数。
+  // VXP/VKX：视觉X轴P，VKX作为旧命令兼容别名。
   // 它不属于电机内部角度PID，所以修改后无需调用DFOC_X_SET_ANGLE_PID。
-  else if (strcmp(name, "VKX") == 0) {
+  else if (
+    strcmp(name, "VXP") == 0 ||
+    strcmp(name, "VKX") == 0
+  ) {
     if (value >= VISION_K_MIN && value <= VISION_K_MAX) {
       visionKx = value;
       updated = true;
     }
   }
 
-  // VKY：视觉Y轴比例系数。
-  else if (strcmp(name, "VKY") == 0) {
+  else if (strcmp(name, "VXI") == 0) {
+    if (value >= VISION_KI_MIN && value <= VISION_KI_MAX) {
+      visionKiX = value;
+      updated = true;
+    }
+  }
+
+  else if (strcmp(name, "VXD") == 0) {
+    if (value >= VISION_KD_MIN && value <= VISION_KD_MAX) {
+      visionKdX = value;
+      updated = true;
+    }
+  }
+
+  // VYP/VKY：视觉Y轴P，VKY作为旧命令兼容别名。
+  else if (
+    strcmp(name, "VYP") == 0 ||
+    strcmp(name, "VKY") == 0
+  ) {
     if (value >= VISION_K_MIN && value <= VISION_K_MAX) {
       visionKy = value;
+      updated = true;
+    }
+  }
+
+  else if (strcmp(name, "VYI") == 0) {
+    if (value >= VISION_KI_MIN && value <= VISION_KI_MAX) {
+      visionKiY = value;
+      updated = true;
+    }
+  }
+
+  else if (strcmp(name, "VYD") == 0) {
+    if (value >= VISION_KD_MIN && value <= VISION_KD_MAX) {
+      visionKdY = value;
       updated = true;
     }
   }
