@@ -1,5 +1,6 @@
 ﻿#include <Arduino.h>
 #include "DengFOC.h"
+#include "vision_protocol.h"
 #include "WiFi.h"
 #include "WiFiUdp.h"
 #include <Preferences.h>  // 把参数保存到 ESP32 的非易失性 Flash 中。
@@ -84,6 +85,8 @@
 #define MAX_TRACK_SPEED_X    0.6f    // x轴跟踪最大速度
 #define MAX_TRACK_SPEED_Y    0.6f    // y轴跟踪最大速度
 #define VISION_DEAD_ZONE     5.0f    // 中心死区像素
+#define VISION_CONFIDENCE_MIN 70     // 低于该置信度的目标不参与追踪
+#define VISION_LOST_TIMEOUT_MS 200   // 超时后按丢失目标处理
 #define VISION_DIR_X         1.0     // X轴视觉误差方向
 #define VISION_DIR_Y         1.0     // Y轴视觉误差方向
 
@@ -170,7 +173,6 @@ IPAddress vofaTelemetryIp(192, 168, 4, 255);     // 广播发送
 uint16_t vofaTelemetryPort = 1347;               // VOFA端口
 const uint32_t VOFA_TELEMETRY_INTERVAL_MS = 20;  // 50Hz
 
-
 // ============================== 函数提前声明 ==============================
 void receiveUdpCommand();  // 检查并解析一条VOFA命令
 void sendVofaData();       // 以固定频率回传两轴状态
@@ -182,9 +184,25 @@ void resetParameters();    // 恢复PID和视觉默认值并写入Flash
 // ============================== 视觉模块串口 ==============================
 // 创建串口对象
 HardwareSerial VisionSerial(1);   // (1) 表示绑定ESP32的UART1控制器
+VisionPacketParser visionParser;
+
+// 保存最近一帧视觉状态，供50Hz VOFA遥测使用。
+int16_t visionDeltaX = 0;
+int16_t visionDeltaY = 0;
+uint8_t visionConfidence = 0;
+bool visionTrackingValid = false;
+
+static float applyVisionSoftDeadZone(float error)
+{
+  float magnitude = fabsf(error);
+  if (magnitude <= VISION_DEAD_ZONE) {
+    return 0.0f;
+  }
+
+  return copysignf(magnitude - VISION_DEAD_ZONE, error);
+}
 
 void setup() {
-
   // 读取模式
   pinMode(DEBUG_PIN, INPUT_PULLUP);
   delay(30);  // 按键消抖
@@ -211,7 +229,7 @@ void setup() {
   // 初始化视觉通信串口：
   VisionSerial.begin(
     115200,       // 波特率
-     SERIAL_8E1,  // 8位数据位、偶校验、1位停止位
+     SERIAL_8N1,  // 8位数据位、无校验、1位停止位
      16,          // RX脚
      17           // TX脚
     );         
@@ -257,17 +275,44 @@ void setup() {
 
 void loop() {
 
-  // 从UART1读取并解析视觉模块的一条完整命令。
-  bool visionFrameReceived = serialReceiveUserCommandXY(VisionSerial);
+  // 从UART1读取并校验最新的11字节二进制视觉帧。
+  VisionFrame visionFrame = {};
+  bool visionFrameReceived =
+    visionParser.poll(VisionSerial, visionFrame);
+  unsigned long now = millis();
+
+  if (visionFrameReceived) {
+    visionDeltaX = visionFrame.delta_x;
+    visionDeltaY = visionFrame.delta_y;
+    visionConfidence = visionFrame.confidence;
+  }
+
+  bool visionFrameAccepted =
+    visionFrameReceived &&
+    visionFrame.target_found &&
+    visionFrame.confidence >= VISION_CONFIDENCE_MIN;
+
+  if (visionFrameReceived) {
+    visionTrackingValid = visionFrameAccepted;
+  }
+
+  // 收到丢目标/低置信度帧，或超过200ms没有有效帧时停止更新目标。
+  if (
+    (visionFrameReceived && !visionFrameAccepted) ||
+    (
+      command_received &&
+      now - last_command_ms > VISION_LOST_TIMEOUT_MS
+    )
+  ) {
+    command_received = false;
+    visionTrackingValid = false;
+  }
 
 
   // 只有视觉数据更新时，才重新计算一次视觉目标角度。
   // 如果本轮没有新视觉帧，targetX和targetY保持原值，
   // 只有不是机械零点定位模式下才使用
-  if(visionFrameReceived && !mechanicalCalibrationMode) {
-
-    // millis()返回系统启动后的毫秒数，类型为unsigned long。
-    unsigned long now = millis();  // 获取当前时间
+  if(visionFrameAccepted && !mechanicalCalibrationMode) {
 
     // 计算两帧视觉数据是时间间隔，第一帧没有上一次时间所以加上条件语句判断是否是第一帧并且给默认数值
     float dt = command_received ? (now - last_command_ms) * 0.001f : 0.033f;
@@ -276,20 +321,14 @@ void loop() {
     // 防止dt过小通信停顿后突然变大
     dt = constrain(dt, 0.005f, 0.1f);
 
-    float visionErroeX = serial_motor_target_X(); // 获取X像素误差
-    float visionErroeY = serial_motor_target_Y(); // 获取Y像素误差
-
-    // 判断是不是在死区里。不能用 else if 必须都要执行
-    if(fabs(visionErroeX) < VISION_DEAD_ZONE) {
-      visionErroeX = 0.0f;
-    } 
-    if(fabs(visionErroeY) < VISION_DEAD_ZONE) {
-      visionErroeY = 0.0f;
-    }
+    float visionErrorX =
+      applyVisionSoftDeadZone(static_cast<float>(visionFrame.delta_x));
+    float visionErrorY =
+      applyVisionSoftDeadZone(static_cast<float>(visionFrame.delta_y));
 
     // 视觉比例控制：
-    float trackSpeedX = visionKx * VISION_DIR_X * visionErroeX;
-    float trackSpeedY = visionKy * VISION_DIR_Y * visionErroeY;
+    float trackSpeedX = visionKx * VISION_DIR_X * visionErrorX;
+    float trackSpeedY = visionKy * VISION_DIR_Y * visionErrorY;
 
     // 速度限幅
     trackSpeedX = constrain(trackSpeedX, -MAX_TRACK_SPEED_X, MAX_TRACK_SPEED_X);
@@ -345,13 +384,13 @@ void loop() {
   }
 }
 
-
 // ============================================================================
 // sendVofaData()：以FireWater文本格式回传两轴状态
 //
-// 优化模式通道顺序（每轴7项）：
-// targetAngle, angle, angleError, targetVelocity,
-// velocity, velocityError, Uq
+// 优化模式通道顺序：
+// X轴4项：targetAngle, angle, angleError, velocity
+// Y轴4项：targetAngle, angle, angleError, velocity
+// 视觉4项：deltaX, deltaY, confidence, trackingValid
 //
 // 原算法模式保持原来的8通道：
 // targetX, angleX, errorX, velocityX,
@@ -377,22 +416,21 @@ void sendVofaData() {
   int length = snprintf(
     packet,
     sizeof(packet),
-    "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-    "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
-    stateX.target_angle,
-    stateX.angle,
-    stateX.angle_error,
-    stateX.target_velocity,
-    stateX.velocity,
-    stateX.velocity_error,
-    stateX.voltage,
-    stateY.target_angle,
-    stateY.angle,
-    stateY.angle_error,
-    stateY.target_velocity,
-    stateY.velocity,
-    stateY.velocity_error,
-    stateY.voltage
+    "%.4f,%.4f,%.4f,%.4f,"
+    "%.4f,%.4f,%.4f,%.4f,"
+    "%.4f,%.4f,%.4f,%.4f\n",
+    stateX.target_angle,     // X目标角度
+    stateX.angle,            // X现实角度
+    stateX.angle_error,      // X角度误差
+    stateX.velocity,         // X速度
+    stateY.target_angle,     // Y目标角度
+    stateY.angle,            // Y角度
+    stateY.angle_error,      // Y角度误差
+    stateY.velocity,         // Y速度
+    static_cast<float>(visionDeltaX),      // 视觉X像素误差
+    static_cast<float>(visionDeltaY),      // 视觉Y像素误差
+    static_cast<float>(visionConfidence),  // 视觉置信度0~100
+    visionTrackingValid ? 1.0f : 0.0f      // 视觉帧是否参与追踪
   );
 #else
   float angleX = DFOC_X_Angle();
@@ -574,7 +612,6 @@ void resetParameters() {
 
   saveParameters();
 }
-
 
 // ============================================================================
 // receiveUdpCommand()：接收并处理一条VOFA调参命令
