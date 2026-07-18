@@ -90,6 +90,10 @@
 #define DEBUG_PIN       2   // 上电模式选择引脚，低电平进入WiFi调试模式
 #define DEBUG_LED_PIN   21  // 外接LED：普通模式低电平，WiFi调试模式高电平
 
+// 1：使用带实际速度反馈的优化串级环；0：使用原来的控制算法。
+// 这是编译期开关，不会在控制循环中增加运行时判断开销。
+#define USE_OPTIMIZED_CASCADE  1
+
 #define MECHANICAL_ZERO_MIN  (-2.0f * PI)
 #define MECHANICAL_ZERO_MAX  ( 2.0f * PI)
 
@@ -324,8 +328,13 @@ void loop() {
     DFOC_Y_setTorque(0.0f);
   }
   else {
+#if USE_OPTIMIZED_CASCADE
+    DFOC_X_set_Optimized_Velocity_Angle(targetX);
+    DFOC_Y_set_Optimized_Velocity_Angle(targetY);
+#else
     DFOC_X_set_Velocity_Angle(targetX);
     DFOC_Y_set_Velocity_Angle(targetY);
+#endif
   }
 
   // 电机控制优先完成，再非阻塞检查UDP调参命令。
@@ -340,11 +349,15 @@ void loop() {
 // ============================================================================
 // sendVofaData()：以FireWater文本格式回传两轴状态
 //
-// 通道顺序：
+// 优化模式通道顺序（每轴7项）：
+// targetAngle, angle, angleError, targetVelocity,
+// velocity, velocityError, Uq
+//
+// 原算法模式保持原来的8通道：
 // targetX, angleX, errorX, velocityX,
 // targetY, angleY, errorY, velocityY
 //
-// 角度和速度读取的是FOC本轮已经更新的AS5600缓存，不会增加I2C访问。
+// 数据来自FOC本轮控制快照，不增加I2C访问，也不会再次推进速度滤波器。
 // 固定50Hz发送，避免每次高速控制循环都进行字符串格式化和UDP发送。
 // ============================================================================
 void sendVofaData() {
@@ -357,6 +370,31 @@ void sendVofaData() {
   }
   lastSendMs = nowMs;
 
+#if USE_OPTIMIZED_CASCADE
+  DFOCControlState stateX = DFOC_X_ControlState();
+  DFOCControlState stateY = DFOC_Y_ControlState();
+  char packet[256];
+  int length = snprintf(
+    packet,
+    sizeof(packet),
+    "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+    "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+    stateX.target_angle,
+    stateX.angle,
+    stateX.angle_error,
+    stateX.target_velocity,
+    stateX.velocity,
+    stateX.velocity_error,
+    stateX.voltage,
+    stateY.target_angle,
+    stateY.angle,
+    stateY.angle_error,
+    stateY.target_velocity,
+    stateY.velocity,
+    stateY.velocity_error,
+    stateY.voltage
+  );
+#else
   float angleX = DFOC_X_Angle();
   float angleY = DFOC_Y_Angle();
   float velocityX = DFOC_X_Velocity();
@@ -376,6 +414,7 @@ void sendVofaData() {
     targetY - angleY,
     velocityY
   );
+#endif
 
   if (length <= 0 || length >= static_cast<int>(sizeof(packet))) {
     return;
@@ -810,6 +849,7 @@ void receiveUdpCommand() {
   else if (strcmp(name, "CAL") == 0) {
     if (value == 1.0f) {
       mechanicalCalibrationMode = true;
+      DFOC_RESET_CONTROLLERS();
       updated = true;
     }
   }
@@ -833,6 +873,7 @@ void receiveUdpCommand() {
 
       saveParameters();
       mechanicalCalibrationMode = false;
+      DFOC_RESET_CONTROLLERS();
       command_received = false;
       updated = true;
     }
@@ -844,6 +885,7 @@ void receiveUdpCommand() {
       targetY = DFOC_Y_Angle();
 
       mechanicalCalibrationMode = false;
+      DFOC_RESET_CONTROLLERS();
       command_received = false;
       updated = true;
     }

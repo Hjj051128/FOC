@@ -87,8 +87,28 @@ void DFOC_SET_MECHANICAL_ZERO(float zeroX, float zeroY);
 void DFOC_CLEAR_MECHANICAL_ZERO();
 
 // 获取X/Y轴速度，单位一般是 rad/s。
+// These functions advance the velocity estimator; telemetry should use ControlState().
 float DFOC_X_Velocity();
 float DFOC_Y_Velocity();
+
+// Cached data from the most recent cascade-control cycle.
+// Angles use rad, velocities use rad/s, and voltage uses V.
+struct DFOCControlState
+{
+    float target_angle;
+    float angle;
+    float angle_error;
+    float target_velocity;
+    float velocity;
+    float velocity_error;
+    float voltage;
+};
+
+DFOCControlState DFOC_X_ControlState();
+DFOCControlState DFOC_Y_ControlState();
+
+// Clear PID, derivative-filter, and velocity-filter history on mode changes.
+void DFOC_RESET_CONTROLLERS();
 
 // 旧M0接口：等价于X轴。
 float DFOC_M0_Angle();
@@ -140,6 +160,13 @@ void DFOC_X_set_Velocity_Angle(float Target);
 void DFOC_Y_set_Velocity_Angle(float Target);
 void DFOC_M0_set_Velocity_Angle(float Target);
 void DFOC_M1_set_Velocity_Angle(float Target);
+
+// Optimized cascade: angle loop creates a velocity target, then the
+// velocity loop closes the feedback with measured encoder velocity.
+void DFOC_X_set_Optimized_Velocity_Angle(float Target);
+void DFOC_Y_set_Optimized_Velocity_Angle(float Target);
+void DFOC_M0_set_Optimized_Velocity_Angle(float Target);
+void DFOC_M1_set_Optimized_Velocity_Angle(float Target);
 
 // 速度闭环控制。Target单位 rad/s。
 void DFOC_X_setVelocity(float Target);

@@ -7,6 +7,9 @@
 #define _constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
 #define _3PI_2 4.71238898038f
 
+static constexpr float RAD_TO_DEG_F = 180.0f / PI;
+static constexpr float DEG_TO_RAD_F = PI / 180.0f;
+
 // 驱动器母线电压，单位 V。setTorque() 最后会根据它限制最大输出电压。
 float voltage_power_supply = 12.0f;
 
@@ -45,17 +48,28 @@ static float normalizeMechanicalAngle(float angle)
   return angle;
 }
 
-// 速度缓存低通滤波器：X轴20ms，Y轴10ms。
+// 速度缓存低通滤波器：X/Y轴都是10ms。
 LowPassFilter vel_filter_X = LowPassFilter(0.01f);
 LowPassFilter vel_filter_Y = LowPassFilter(0.01f);
 
 // 角度PID的D支路滤波时间常数。5ms约对应31.8Hz截止频率。
 static constexpr float ANGLE_D_FILTER_TF_X = 0.005f;
 static constexpr float ANGLE_D_FILTER_TF_Y = 0.005f;
+// 速度D支路更容易放大编码器差分噪声，因此采用10ms滤波。
+// SPEEDKD为0时这部分不参与计算，也没有额外运行开销。
+static constexpr float SPEED_D_FILTER_TF_X = 0.010f;
+static constexpr float SPEED_D_FILTER_TF_Y = 0.010f;
 
 // X/Y各自独立的PID控制器。
 // angle_loop 输出给速度环，vel_loop 输出给FOC的Uq电压。
-PIDController vel_loop_X(2, 0, 0, 100000, 0);
+PIDController vel_loop_X(
+  2,
+  0,
+  0,
+  100000,
+  0,
+  SPEED_D_FILTER_TF_X
+);
 PIDController angle_loop_X(
   2,
   0,
@@ -64,7 +78,14 @@ PIDController angle_loop_X(
   100,
   ANGLE_D_FILTER_TF_X
 );
-PIDController vel_loop_Y(2, 0, 0, 100000, 0);
+PIDController vel_loop_Y(
+  2,
+  0,
+  0,
+  100000,
+  0,
+  SPEED_D_FILTER_TF_Y
+);
 PIDController angle_loop_Y(
   2,
   0,
@@ -73,6 +94,9 @@ PIDController angle_loop_Y(
   100,
   ANGLE_D_FILTER_TF_Y
 );
+
+static DFOCControlState control_state_X = {};
+static DFOCControlState control_state_Y = {};
 
 // X轴AS5600：I2C0，当前接线 SDA=GPIO8，SCL=GPIO9。
 Sensor_AS5600 sensorX = Sensor_AS5600(0);
@@ -129,6 +153,26 @@ static void torqueToPhaseVoltage(float Uq, float angle_el, float &Ua, float &Ub,
   Uc = (-Ualpha - sqrt(3.0f) * Ubeta) / 2.0f + voltage_power_supply / 2.0f;
 }
 
+// Apply an already calculated torque command without sampling the encoder again.
+// Closed-loop functions sample first, calculate from that sample, then call this.
+static void applyTorqueX(float Uq, float angle_el)
+{
+  float Ua = 0.0f;
+  float Ub = 0.0f;
+  float Uc = 0.0f;
+  torqueToPhaseVoltage(Uq, angle_el, Ua, Ub, Uc);
+  setPwmX(Ua, Ub, Uc);
+}
+
+static void applyTorqueY(float Uq, float angle_el)
+{
+  float Ua = 0.0f;
+  float Ub = 0.0f;
+  float Uc = 0.0f;
+  torqueToPhaseVoltage(Uq, angle_el, Ua, Ub, Uc);
+  setPwmY(Ua, Ub, Uc);
+}
+
 // 把任意角度归一化到 0 ~ 2PI。
 float _normalizeAngle(float angle)
 {
@@ -164,22 +208,14 @@ void setTorque(float Uq, float angle_el)
 void setTorqueX(float Uq, float angle_el)
 {
   sensorX.Sensor_update();
-  float Ua = 0.0f;
-  float Ub = 0.0f;
-  float Uc = 0.0f;
-  torqueToPhaseVoltage(Uq, angle_el, Ua, Ub, Uc);
-  setPwmX(Ua, Ub, Uc);
+  applyTorqueX(Uq, angle_el);
 }
 
 // Y轴FOC输出。和X轴逻辑相同，但是使用Y轴编码器和Y轴PWM引脚。
 void setTorqueY(float Uq, float angle_el)
 {
   sensorY.Sensor_update();
-  float Ua = 0.0f;
-  float Ub = 0.0f;
-  float Uc = 0.0f;
-  torqueToPhaseVoltage(Uq, angle_el, Ua, Ub, Uc);
-  setPwmY(Ua, Ub, Uc);
+  applyTorqueY(Uq, angle_el);
 }
 
 // 旧电角度接口：保留给以前代码用，默认返回X轴电角度。
@@ -215,7 +251,16 @@ void DFOC_X_Vbus(float power_supply)
   i2cX.begin(8, 9, 400000UL);
   sensorX.Sensor_init(&i2cX);
 
-  vel_loop_X = PIDController(2, 0, 0, 100000, voltage_power_supply / 2.0f);
+  vel_loop_X = PIDController(
+    2,
+    0,
+    0,
+    100000,
+    voltage_power_supply / 2.0f,
+    SPEED_D_FILTER_TF_X
+  );
+  sensorX.resetVelocity();
+  vel_filter_X.reset();
 }
 
 // 初始化Y轴：配置三相PWM，启动第二路I2C上的Y轴AS5600。
@@ -234,7 +279,16 @@ void DFOC_Y_Vbus(float power_supply)
   i2cY.begin(14, 15, 100000UL);
   sensorY.Sensor_init(&i2cY);
 
-  vel_loop_Y = PIDController(2, 0, 0, 100000, voltage_power_supply / 2.0f);
+  vel_loop_Y = PIDController(
+    2,
+    0,
+    0,
+    100000,
+    voltage_power_supply / 2.0f,
+    SPEED_D_FILTER_TF_Y
+  );
+  sensorY.resetVelocity();
+  vel_filter_Y.reset();
 }
 
 // 旧初始化接口：保留给以前代码用，默认初始化X轴。
@@ -261,7 +315,11 @@ void DFOC_X_alignSensor(int _PP, int _DIR)
   sensorX.Sensor_update();
   zero_electric_angle_X = _electricalAngleX();
   setTorqueX(0.0f, _3PI_2);
-
+  sensorX.resetVelocity();
+  vel_filter_X.reset();
+  angle_loop_X.reset();
+  vel_loop_X.reset();
+  control_state_X = {};
 }
 
 // Y轴传感器校准。逻辑和X轴完全一样，但使用Y轴硬件。
@@ -275,7 +333,11 @@ void DFOC_Y_alignSensor(int _PP, int _DIR)
   sensorY.Sensor_update();
   zero_electric_angle_Y = _electricalAngleY();
   setTorqueY(0.0f, _3PI_2);
-
+  sensorY.resetVelocity();
+  vel_filter_Y.reset();
+  angle_loop_Y.reset();
+  vel_loop_Y.reset();
+  control_state_Y = {};
 }
 
 // 旧校准接口：保留给以前代码用，默认校准X轴。
@@ -358,6 +420,30 @@ float DFOC_Y_Velocity()
   return vel_filter_Y(sensor_dir_Y * velocity_raw_Y);
 }
 
+DFOCControlState DFOC_X_ControlState()
+{
+  return control_state_X;
+}
+
+DFOCControlState DFOC_Y_ControlState()
+{
+  return control_state_Y;
+}
+
+void DFOC_RESET_CONTROLLERS()
+{
+  sensorX.resetVelocity();
+  sensorY.resetVelocity();
+  vel_filter_X.reset();
+  vel_filter_Y.reset();
+  angle_loop_X.reset();
+  vel_loop_X.reset();
+  angle_loop_Y.reset();
+  vel_loop_Y.reset();
+  control_state_X = {};
+  control_state_Y = {};
+}
+
 float DFOC_M0_Velocity()
 {
   return DFOC_X_Velocity();
@@ -375,6 +461,7 @@ void DFOC_X_SET_VEL_PID(float P, float I, float D, float ramp)
   vel_loop_X.I = I;
   vel_loop_X.D = D;
   vel_loop_X.output_ramp = ramp;
+  vel_loop_X.reset();
 }
 
 // 设置Y轴速度环PID参数。
@@ -384,6 +471,7 @@ void DFOC_Y_SET_VEL_PID(float P, float I, float D, float ramp)
   vel_loop_Y.I = I;
   vel_loop_Y.D = D;
   vel_loop_Y.output_ramp = ramp;
+  vel_loop_Y.reset();
 }
 
 // M0兼容接口：设置X轴速度环PID。
@@ -405,6 +493,7 @@ void DFOC_X_SET_ANGLE_PID(float P, float I, float D, float ramp)
   angle_loop_X.I = I;
   angle_loop_X.D = D;
   angle_loop_X.output_ramp = ramp;
+  angle_loop_X.reset();
 }
 
 // 设置Y轴角度环PID参数。
@@ -414,6 +503,7 @@ void DFOC_Y_SET_ANGLE_PID(float P, float I, float D, float ramp)
   angle_loop_Y.I = I;
   angle_loop_Y.D = D;
   angle_loop_Y.output_ramp = ramp;
+  angle_loop_Y.reset();
 }
 
 // M0兼容接口：设置X轴角度环PID。
@@ -561,17 +651,77 @@ float serial_motor_target_Y()
   return motor_target_Y;
 }
 
-// X轴位置+速度串级控制。
-// 目标角度 -> 角度环 -> 目标速度/中间量 -> 速度环 -> Uq -> FOC输出。
+// 保留原来的X轴控制算法，便于随时切换回来对比。
 void DFOC_X_set_Velocity_Angle(float Target)
 {
   setTorqueX(DFOC_X_VEL_PID(DFOC_X_ANGLE_PID((Target - DFOC_X_Angle()) * 180.0f / PI)), _electricalAngleX());
 }
 
-// Y轴位置+速度串级控制。
+// 保留原来的Y轴控制算法。
 void DFOC_Y_set_Velocity_Angle(float Target)
 {
   setTorqueY(DFOC_Y_VEL_PID(DFOC_Y_ANGLE_PID((Target - DFOC_Y_Angle()) * 180.0f / PI)), _electricalAngleY());
+}
+
+// 优化后的X轴位置+速度串级控制。
+// 目标角度 -> 角度误差 -> 角度环 -> 目标速度
+// 目标速度 - 实际速度 -> 速度环 -> Uq -> FOC输出。
+void DFOC_X_set_Optimized_Velocity_Angle(float Target)
+{
+  // One encoder sample drives angle, velocity, and electrical angle in this cycle.
+  sensorX.Sensor_update();
+
+  float angle = DFOC_X_Angle();
+  float angle_error = Target - angle;
+  float target_velocity_deg =
+    DFOC_X_ANGLE_PID(angle_error * RAD_TO_DEG_F);
+  float target_velocity =
+    target_velocity_deg * DEG_TO_RAD_F;
+  float velocity = DFOC_X_Velocity();
+  float velocity_error = target_velocity - velocity;
+  float voltage =
+    DFOC_X_VEL_PID(velocity_error * RAD_TO_DEG_F);
+
+  control_state_X = {
+    Target,
+    angle,
+    angle_error,
+    target_velocity,
+    velocity,
+    velocity_error,
+    voltage
+  };
+
+  applyTorqueX(voltage, _electricalAngleX());
+}
+
+// 优化后的Y轴位置+速度串级控制。
+void DFOC_Y_set_Optimized_Velocity_Angle(float Target)
+{
+  sensorY.Sensor_update();
+
+  float angle = DFOC_Y_Angle();
+  float angle_error = Target - angle;
+  float target_velocity_deg =
+    DFOC_Y_ANGLE_PID(angle_error * RAD_TO_DEG_F);
+  float target_velocity =
+    target_velocity_deg * DEG_TO_RAD_F;
+  float velocity = DFOC_Y_Velocity();
+  float velocity_error = target_velocity - velocity;
+  float voltage =
+    DFOC_Y_VEL_PID(velocity_error * RAD_TO_DEG_F);
+
+  control_state_Y = {
+    Target,
+    angle,
+    angle_error,
+    target_velocity,
+    velocity,
+    velocity_error,
+    voltage
+  };
+
+  applyTorqueY(voltage, _electricalAngleY());
 }
 
 // M0兼容接口：控制X轴位置。
@@ -586,16 +736,62 @@ void DFOC_M1_set_Velocity_Angle(float Target)
   DFOC_Y_set_Velocity_Angle(Target);
 }
 
+void DFOC_M0_set_Optimized_Velocity_Angle(float Target)
+{
+  DFOC_X_set_Optimized_Velocity_Angle(Target);
+}
+
+void DFOC_M1_set_Optimized_Velocity_Angle(float Target)
+{
+  DFOC_Y_set_Optimized_Velocity_Angle(Target);
+}
+
 // X轴速度闭环控制，Target单位 rad/s。
 void DFOC_X_setVelocity(float Target)
 {
-  setTorqueX(DFOC_X_VEL_PID((Target - DFOC_X_Velocity()) * 180.0f / PI), _electricalAngleX());
+  sensorX.Sensor_update();
+
+  float angle = DFOC_X_Angle();
+  float velocity = DFOC_X_Velocity();
+  float velocity_error = Target - velocity;
+  float voltage =
+    DFOC_X_VEL_PID(velocity_error * RAD_TO_DEG_F);
+
+  control_state_X = {
+    angle,
+    angle,
+    0.0f,
+    Target,
+    velocity,
+    velocity_error,
+    voltage
+  };
+
+  applyTorqueX(voltage, _electricalAngleX());
 }
 
 // Y轴速度闭环控制，Target单位 rad/s。
 void DFOC_Y_setVelocity(float Target)
 {
-  setTorqueY(DFOC_Y_VEL_PID((Target - DFOC_Y_Velocity()) * 180.0f / PI), _electricalAngleY());
+  sensorY.Sensor_update();
+
+  float angle = DFOC_Y_Angle();
+  float velocity = DFOC_Y_Velocity();
+  float velocity_error = Target - velocity;
+  float voltage =
+    DFOC_Y_VEL_PID(velocity_error * RAD_TO_DEG_F);
+
+  control_state_Y = {
+    angle,
+    angle,
+    0.0f,
+    Target,
+    velocity,
+    velocity_error,
+    voltage
+  };
+
+  applyTorqueY(voltage, _electricalAngleY());
 }
 
 void DFOC_M0_setVelocity(float Target)
@@ -612,13 +808,25 @@ void DFOC_M1_setVelocity(float Target)
 // 它比串级控制更直接，但更容易抖，云台一般优先用串级控制。
 void DFOC_X_set_Force_Angle(float Target)
 {
-  setTorqueX(DFOC_X_ANGLE_PID((Target - DFOC_X_Angle()) * 180.0f / PI), _electricalAngleX());
+  sensorX.Sensor_update();
+  applyTorqueX(
+    DFOC_X_ANGLE_PID(
+      (Target - DFOC_X_Angle()) * RAD_TO_DEG_F
+    ),
+    _electricalAngleX()
+  );
 }
 
 // Y轴位置力矩控制。
 void DFOC_Y_set_Force_Angle(float Target)
 {
-  setTorqueY(DFOC_Y_ANGLE_PID((Target - DFOC_Y_Angle()) * 180.0f / PI), _electricalAngleY());
+  sensorY.Sensor_update();
+  applyTorqueY(
+    DFOC_Y_ANGLE_PID(
+      (Target - DFOC_Y_Angle()) * RAD_TO_DEG_F
+    ),
+    _electricalAngleY()
+  );
 }
 
 void DFOC_M0_set_Force_Angle(float Target)

@@ -15,6 +15,7 @@ public:
     ~PIDController() = default;
 
     float operator() (float error);
+    void reset(float output = 0.0f);
 
     float P; //!< 比例增益(P环增益)
     float I; //!< 积分增益（I环增益）

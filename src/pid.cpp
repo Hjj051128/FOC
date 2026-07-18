@@ -26,6 +26,16 @@ PIDController::PIDController(
     timestamp_prev = micros();
 }
 
+void PIDController::reset(float output)
+{
+    error_prev = 0.0f;
+    output_prev = _constrain(output, -limit, limit);
+    integral_prev = 0.0f;
+    derivative_prev = 0.0f;
+    timestamp_prev = micros();
+    initialized = false;
+}
+
 // PID 控制器函数
 float PIDController::operator() (float error){
     // 计算两次循环中间的间隔时间
@@ -36,7 +46,9 @@ float PIDController::operator() (float error){
     // P环
     float proportional = P * error;
     // Tustin 散点积分（I环）
-    float integral = integral_prev + I*Ts*0.5f*(error + error_prev);
+    float integral =
+        integral_prev +
+        I * Ts * 0.5f * (error + error_prev);
     integral = _constrain(integral, -limit, limit);
 
     // D环采用带限微分器，只滤波误差变化率，不拖慢P和I。
@@ -66,7 +78,25 @@ float PIDController::operator() (float error){
     }
 
     // 将P,I,D三环的计算值加起来
-    float output = proportional + integral + derivative;
+    // Freeze integration only when saturation and error push the same way.
+    // Integration remains active in the opposite direction so it can unwind.
+    float unsaturated_output = proportional + integral + derivative;
+    bool pushes_high =
+        unsaturated_output > limit &&
+        error > 0.0f;
+    bool pushes_low =
+        unsaturated_output < -limit &&
+        error < 0.0f;
+
+    if (pushes_high || pushes_low) {
+        integral = integral_prev;
+        unsaturated_output =
+            proportional +
+            integral +
+            derivative;
+    }
+
+    float output = unsaturated_output;
     output = _constrain(output, -limit, limit);
 
     if(output_ramp > 0){

@@ -73,6 +73,12 @@ void Sensor_AS5600::Sensor_update() {
     angle_prev = val;
 }
 
+void Sensor_AS5600::resetVelocity() {
+    vel_angle_prev = angle_prev;
+    vel_full_rotations = full_rotations;
+    vel_angle_prev_ts = angle_prev_ts;
+}
+
 float Sensor_AS5600::getMechanicalAngle() {
     return angle_prev;
 }
@@ -83,7 +89,8 @@ float Sensor_AS5600::getAngle(){
 
 float Sensor_AS5600::getVelocity() {
     // 计算采样时间
-    float Ts = (angle_prev_ts - vel_angle_prev_ts)*1e-6;
+    uint32_t elapsed_us = angle_prev_ts - vel_angle_prev_ts;
+    float Ts = elapsed_us * 1e-6f;
     // 快速修复奇怪的情况（微溢出）
     if(Ts <= 0) Ts = 1e-3f;
     // 速度计算

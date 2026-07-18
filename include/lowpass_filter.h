@@ -17,6 +17,7 @@ public:
     ~LowPassFilter() = default;
 
     float operator() (float x);
+    void reset(float value = 0.0f);
     float Tf; //!< 低通滤波时间常数
 
 protected:

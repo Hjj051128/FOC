@@ -7,6 +7,11 @@ LowPassFilter::LowPassFilter(float time_constant)
     timestamp_prev = micros();
 }
 
+void LowPassFilter::reset(float value)
+{
+    y_prev = value;
+    timestamp_prev = micros();
+}
 
 float LowPassFilter::operator() (float x)
 {
