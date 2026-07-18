@@ -1,11 +1,16 @@
 #include <Arduino.h>
 #include "DengFOC.h"
 #include "AS5600.h"
+#include "angle_velocity_observer.h"
 #include "lowpass_filter.h"
 #include "pid.h"
 
 #define _constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
 #define _3PI_2 4.71238898038f
+
+// 1 uses the second-order observer in the optimized cascade.
+// 0 returns that cascade to the original velocity-difference low-pass filter.
+#define USE_ADVANCED_VELOCITY_OBSERVER  1
 
 static constexpr float RAD_TO_DEG_F = 180.0f / PI;
 static constexpr float DEG_TO_RAD_F = PI / 180.0f;
@@ -51,6 +56,15 @@ static float normalizeMechanicalAngle(float angle)
 // 速度缓存低通滤波器：X/Y轴都是10ms。
 LowPassFilter vel_filter_X = LowPassFilter(0.01f);
 LowPassFilter vel_filter_Y = LowPassFilter(0.01f);
+
+static constexpr float VELOCITY_OBSERVER_BANDWIDTH_HZ_X = 25.0f;
+static constexpr float VELOCITY_OBSERVER_BANDWIDTH_HZ_Y = 25.0f;
+AngleVelocityObserver velocity_observer_X(
+  VELOCITY_OBSERVER_BANDWIDTH_HZ_X
+);
+AngleVelocityObserver velocity_observer_Y(
+  VELOCITY_OBSERVER_BANDWIDTH_HZ_Y
+);
 
 // 角度PID的D支路滤波时间常数。5ms约对应31.8Hz截止频率。
 static constexpr float ANGLE_D_FILTER_TF_X = 0.005f;
@@ -261,6 +275,7 @@ void DFOC_X_Vbus(float power_supply)
   );
   sensorX.resetVelocity();
   vel_filter_X.reset();
+  velocity_observer_X.reset();
 }
 
 // 初始化Y轴：配置三相PWM，启动第二路I2C上的Y轴AS5600。
@@ -289,6 +304,7 @@ void DFOC_Y_Vbus(float power_supply)
   );
   sensorY.resetVelocity();
   vel_filter_Y.reset();
+  velocity_observer_Y.reset();
 }
 
 // 旧初始化接口：保留给以前代码用，默认初始化X轴。
@@ -317,6 +333,7 @@ void DFOC_X_alignSensor(int _PP, int _DIR)
   setTorqueX(0.0f, _3PI_2);
   sensorX.resetVelocity();
   vel_filter_X.reset();
+  velocity_observer_X.reset();
   angle_loop_X.reset();
   vel_loop_X.reset();
   control_state_X = {};
@@ -335,6 +352,7 @@ void DFOC_Y_alignSensor(int _PP, int _DIR)
   setTorqueY(0.0f, _3PI_2);
   sensorY.resetVelocity();
   vel_filter_Y.reset();
+  velocity_observer_Y.reset();
   angle_loop_Y.reset();
   vel_loop_Y.reset();
   control_state_Y = {};
@@ -436,6 +454,8 @@ void DFOC_RESET_CONTROLLERS()
   sensorY.resetVelocity();
   vel_filter_X.reset();
   vel_filter_Y.reset();
+  velocity_observer_X.reset();
+  velocity_observer_Y.reset();
   angle_loop_X.reset();
   vel_loop_X.reset();
   angle_loop_Y.reset();
@@ -677,7 +697,11 @@ void DFOC_X_set_Optimized_Velocity_Angle(float Target)
     DFOC_X_ANGLE_PID(angle_error * RAD_TO_DEG_F);
   float target_velocity =
     target_velocity_deg * DEG_TO_RAD_F;
+#if USE_ADVANCED_VELOCITY_OBSERVER
+  float velocity = velocity_observer_X.update(angle);
+#else
   float velocity = DFOC_X_Velocity();
+#endif
   float velocity_error = target_velocity - velocity;
   float voltage =
     DFOC_X_VEL_PID(velocity_error * RAD_TO_DEG_F);
@@ -706,7 +730,11 @@ void DFOC_Y_set_Optimized_Velocity_Angle(float Target)
     DFOC_Y_ANGLE_PID(angle_error * RAD_TO_DEG_F);
   float target_velocity =
     target_velocity_deg * DEG_TO_RAD_F;
+#if USE_ADVANCED_VELOCITY_OBSERVER
+  float velocity = velocity_observer_Y.update(angle);
+#else
   float velocity = DFOC_Y_Velocity();
+#endif
   float velocity_error = target_velocity - velocity;
   float voltage =
     DFOC_Y_VEL_PID(velocity_error * RAD_TO_DEG_F);
