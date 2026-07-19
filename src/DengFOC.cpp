@@ -686,17 +686,21 @@ void DFOC_Y_set_Velocity_Angle(float Target)
 // 优化后的X轴位置+速度串级控制。
 // 目标角度 -> 角度误差 -> 角度环 -> 目标速度
 // 目标速度 - 实际速度 -> 速度环 -> Uq -> FOC输出。
-void DFOC_X_set_Optimized_Velocity_Angle(float Target)
+void DFOC_X_set_Position_Velocity(
+  float targetAngle,
+  float targetVelocityFeedforward
+)
 {
   // One encoder sample drives angle, velocity, and electrical angle in this cycle.
   sensorX.Sensor_update();
 
   float angle = DFOC_X_Angle();
-  float angle_error = Target - angle;
-  float target_velocity_deg =
+  float angle_error = targetAngle - angle;
+  float position_correction_deg =
     DFOC_X_ANGLE_PID(angle_error * RAD_TO_DEG_F);
   float target_velocity =
-    target_velocity_deg * DEG_TO_RAD_F;
+    targetVelocityFeedforward +
+    position_correction_deg * DEG_TO_RAD_F;
 #if USE_ADVANCED_VELOCITY_OBSERVER
   float velocity = velocity_observer_X.update(angle);
 #else
@@ -707,7 +711,7 @@ void DFOC_X_set_Optimized_Velocity_Angle(float Target)
     DFOC_X_VEL_PID(velocity_error * RAD_TO_DEG_F);
 
   control_state_X = {
-    Target,
+    targetAngle,
     angle,
     angle_error,
     target_velocity,
@@ -719,17 +723,26 @@ void DFOC_X_set_Optimized_Velocity_Angle(float Target)
   applyTorqueX(voltage, _electricalAngleX());
 }
 
+void DFOC_X_set_Optimized_Velocity_Angle(float Target)
+{
+  DFOC_X_set_Position_Velocity(Target, 0.0f);
+}
+
 // 优化后的Y轴位置+速度串级控制。
-void DFOC_Y_set_Optimized_Velocity_Angle(float Target)
+void DFOC_Y_set_Position_Velocity(
+  float targetAngle,
+  float targetVelocityFeedforward
+)
 {
   sensorY.Sensor_update();
 
   float angle = DFOC_Y_Angle();
-  float angle_error = Target - angle;
-  float target_velocity_deg =
+  float angle_error = targetAngle - angle;
+  float position_correction_deg =
     DFOC_Y_ANGLE_PID(angle_error * RAD_TO_DEG_F);
   float target_velocity =
-    target_velocity_deg * DEG_TO_RAD_F;
+    targetVelocityFeedforward +
+    position_correction_deg * DEG_TO_RAD_F;
 #if USE_ADVANCED_VELOCITY_OBSERVER
   float velocity = velocity_observer_Y.update(angle);
 #else
@@ -740,7 +753,7 @@ void DFOC_Y_set_Optimized_Velocity_Angle(float Target)
     DFOC_Y_VEL_PID(velocity_error * RAD_TO_DEG_F);
 
   control_state_Y = {
-    Target,
+    targetAngle,
     angle,
     angle_error,
     target_velocity,
@@ -750,6 +763,11 @@ void DFOC_Y_set_Optimized_Velocity_Angle(float Target)
   };
 
   applyTorqueY(voltage, _electricalAngleY());
+}
+
+void DFOC_Y_set_Optimized_Velocity_Angle(float Target)
+{
+  DFOC_Y_set_Position_Velocity(Target, 0.0f);
 }
 
 // M0兼容接口：控制X轴位置。

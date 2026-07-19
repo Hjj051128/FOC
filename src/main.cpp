@@ -84,8 +84,8 @@
 #define Y_ANGLE_MAX  1.5f
 
 // ============================== 视觉追踪参数 ==============================
-#define VISION_KX            0.002f  // x轴像素误差转换到速度的比例
-#define VISION_KY            0.002f  // y轴像素误差转换到速度的比例
+#define VISION_KX            0.004f  // x轴像素误差转换到速度的比例
+#define VISION_KY            0.004f  // y轴像素误差转换到速度的比例
 #define VISION_KI_X          0.0f    // X轴视觉积分，调试时从0开始
 #define VISION_KD_X          0.0f    // X轴视觉微分，调试时从0开始
 #define VISION_KI_Y          0.0f
@@ -94,7 +94,7 @@
 #define MAX_TRACK_SPEED_Y    1.2f    // y轴跟踪最大速度
 #define VISION_DEAD_ZONE     5.0f    // 中心死区像素
 #define VISION_CONFIDENCE_MIN 40     // 低于该置信度的目标不参与追踪
-#define VISION_LOST_TIMEOUT_MS 500   // 超时后按丢失目标处理
+#define VISION_LOST_TIMEOUT_MS 150   // 连续无有效目标后进入回中
 #define VISION_DIR_X         1.0     // X轴视觉误差方向
 #define VISION_DIR_Y         1.0     // Y轴视觉误差方向
 
@@ -112,6 +112,18 @@
 #define VISION_COMMAND_HOLD_MS           100
 #define VISION_PID_INTEGRAL_ZONE        40.0f
 #define VISION_PID_INTEGRAL_SPEED_LIMIT 0.2f
+
+// 电机环固定500Hz运行；视觉层只负责异步更新角度和速度指令。
+#define MOTOR_CONTROL_FREQUENCY_HZ       500
+#define MOTOR_CONTROL_PERIOD_MS          (1000 / MOTOR_CONTROL_FREQUENCY_HZ)
+#define MOTOR_CONTROL_TASK_STACK         4096
+#define MOTOR_CONTROL_TASK_PRIORITY      3
+#define MOTOR_CONTROL_TASK_CORE          1
+
+// 脱靶后以受限速度平滑回到机械零点，避免直接跳变目标角度。
+#define AUTO_RETURN_HOME_SPEED_X         1.2f
+#define AUTO_RETURN_HOME_SPEED_Y         1.2f
+#define AUTO_RETURN_HOME_EPSILON         0.002f
 
 #define DEBUG_PIN       2   // 上电模式选择引脚，低电平进入WiFi调试模式
 #define DEBUG_LED_PIN   21  // 外接LED：普通模式低电平，WiFi调试模式高电平
@@ -175,6 +187,9 @@ int EN_Y = 13;
 // 高级模式连续更新目标，旧模式在收到视觉帧时更新。
 float targetX = 0.0f;
 float targetY = 0.0f;
+float targetVelocityFeedforwardX = 0.0f;
+float targetVelocityFeedforwardY = 0.0f;
+bool autoReturnHomeActive = false;
 
 
 // last_command_ms：上一帧有效视觉数据到达的毫秒时间。
@@ -206,6 +221,125 @@ void sendVofaData();       // 以固定频率回传两轴状态
 void loadParameters();     // 开机时从Flash读取参数
 void saveParameters();     // 把当前参数写入Flash
 void resetParameters();    // 恢复PID和视觉默认值并写入Flash
+
+struct MotorControlCommand
+{
+  float targetAngleX;
+  float targetAngleY;
+  float targetVelocityX;
+  float targetVelocityY;
+  bool calibrationMode;
+};
+
+MotorControlCommand motorCommand = {};
+portMUX_TYPE motorCommandMux = portMUX_INITIALIZER_UNLOCKED;
+SemaphoreHandle_t focMutex = nullptr;
+TaskHandle_t motorControlTaskHandle = nullptr;
+bool motorControlTaskStarted = false;
+
+static void publishMotorCommand()
+{
+  MotorControlCommand next = {
+    targetX,
+    targetY,
+    targetVelocityFeedforwardX,
+    targetVelocityFeedforwardY,
+    mechanicalCalibrationMode
+  };
+
+  portENTER_CRITICAL(&motorCommandMux);
+  motorCommand = next;
+  portEXIT_CRITICAL(&motorCommandMux);
+}
+
+static MotorControlCommand readMotorCommand()
+{
+  portENTER_CRITICAL(&motorCommandMux);
+  MotorControlCommand snapshot = motorCommand;
+  portEXIT_CRITICAL(&motorCommandMux);
+  return snapshot;
+}
+
+static bool lockFoc(TickType_t waitTicks = portMAX_DELAY)
+{
+  return focMutex == nullptr ||
+    xSemaphoreTake(focMutex, waitTicks) == pdTRUE;
+}
+
+static void unlockFoc()
+{
+  if (focMutex != nullptr) {
+    xSemaphoreGive(focMutex);
+  }
+}
+
+static void runMotorControlOnce()
+{
+  MotorControlCommand command = readMotorCommand();
+  if (!lockFoc()) {
+    return;
+  }
+
+  if (command.calibrationMode) {
+    DFOC_X_setTorque(0.0f);
+    DFOC_Y_setTorque(0.0f);
+  }
+  else {
+#if USE_OPTIMIZED_CASCADE
+    DFOC_X_set_Position_Velocity(
+      command.targetAngleX,
+      command.targetVelocityX
+    );
+    DFOC_Y_set_Position_Velocity(
+      command.targetAngleY,
+      command.targetVelocityY
+    );
+#else
+    DFOC_X_set_Velocity_Angle(command.targetAngleX);
+    DFOC_Y_set_Velocity_Angle(command.targetAngleY);
+#endif
+  }
+
+  unlockFoc();
+}
+
+static void motorControlTask(void *parameter)
+{
+  (void)parameter;
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  const TickType_t periodTicks =
+    pdMS_TO_TICKS(MOTOR_CONTROL_PERIOD_MS);
+
+  for (;;) {
+    runMotorControlOnce();
+    vTaskDelayUntil(&lastWakeTime, periodTicks);
+  }
+}
+
+static float moveTowardZero(
+  float value,
+  float speed,
+  float dt,
+  float &velocity
+)
+{
+  if (fabsf(value) <= AUTO_RETURN_HOME_EPSILON) {
+    velocity = 0.0f;
+    return 0.0f;
+  }
+
+  velocity = value > 0.0f
+    ? -speed
+    : speed;
+
+  float maxStep = speed * dt;
+  if (fabsf(value) <= maxStep) {
+    velocity = 0.0f;
+    return 0.0f;
+  }
+
+  return value + velocity * dt;
+}
 
 
 // ============================== 视觉模块串口 ==============================
@@ -305,14 +439,41 @@ void setup() {
     // 监听本地端口传来的数据
     udp.begin(udpPort);
   }
+
+  publishMotorCommand();
+  focMutex = xSemaphoreCreateMutex();
+  if (focMutex != nullptr) {
+    BaseType_t taskResult = xTaskCreatePinnedToCore(
+      motorControlTask,
+      "gimbal-control",
+      MOTOR_CONTROL_TASK_STACK,
+      nullptr,
+      MOTOR_CONTROL_TASK_PRIORITY,
+      &motorControlTaskHandle,
+      MOTOR_CONTROL_TASK_CORE
+    );
+    motorControlTaskStarted = taskResult == pdPASS;
+  }
 }
 
 
 void loop() {
 
   // 从UART1读取并校验最新的11字节二进制视觉帧。
-  uint32_t nowUs = micros();
+  uint32_t nowUs = micros();  // 获取当前时间 us
   unsigned long now = millis();
+  static uint32_t lastHighLevelControlUs = 0;
+  float highLevelControlDt = 0.0f;
+  if (lastHighLevelControlUs != 0) {
+    uint32_t elapsedUs = nowUs - lastHighLevelControlUs;
+    highLevelControlDt = constrain(
+      elapsedUs * 1e-6f,
+      0.0f,
+      0.02f
+    );
+  }
+  lastHighLevelControlUs = nowUs;
+
   VisionFrame visionFrame = {};
   bool visionFrameReceived =
     visionParser.poll(VisionSerial, visionFrame);
@@ -328,21 +489,6 @@ void loop() {
     visionFrame.target_found &&
     visionFrame.confidence >= VISION_CONFIDENCE_MIN &&
     !mechanicalCalibrationMode;
-
-  // 收到丢目标/低置信度帧，或超过200ms没有有效帧时停止更新目标。
-  if (
-    (visionFrameReceived && !visionFrameAccepted) ||
-    (
-      visionTrackingValid &&
-      now - last_command_ms > VISION_LOST_TIMEOUT_MS
-    )
-  ) {
-    command_received = false;
-    visionTrackingValid = false;
-#if USE_PREDICTIVE_VISION_TRACKER
-    predictiveVisionTracker.reset();
-#endif
-  }
 
   if (visionFrameAccepted) {
 #if USE_PREDICTIVE_VISION_TRACKER
@@ -369,6 +515,8 @@ void loop() {
     // 速度限幅
     trackSpeedX = constrain(trackSpeedX, -MAX_TRACK_SPEED_X, MAX_TRACK_SPEED_X);
     trackSpeedY = constrain(trackSpeedY, -MAX_TRACK_SPEED_Y, MAX_TRACK_SPEED_Y);
+    targetVelocityFeedforwardX = trackSpeedX;
+    targetVelocityFeedforwardY = trackSpeedY;
 
     // 离散积分：
     targetX += trackSpeedX * dt;
@@ -391,20 +539,33 @@ void loop() {
     last_command_ms = now;
     command_received = true;
     visionTrackingValid = true;
+    autoReturnHomeActive = false;
+  }
+  else if (
+    visionTrackingValid &&
+    now - last_command_ms >= VISION_LOST_TIMEOUT_MS
+  ) {
+    // 单帧低置信度不立即退出；连续超时才进入平滑回中。
+    command_received = false;
+    visionTrackingValid = false;
+    targetVelocityFeedforwardX = 0.0f;
+    targetVelocityFeedforwardY = 0.0f;
+
+    // 回中轨迹从电机实际位置开始，避免最后视觉目标仍在前方时，
+    // 角度环先与回中速度前馈互相对抗。
+    if (lockFoc(pdMS_TO_TICKS(2))) {
+      targetX = DFOC_X_Angle();
+      targetY = DFOC_Y_Angle();
+      unlockFoc();
+    }
+
+    autoReturnHomeActive = true;
+#if USE_PREDICTIVE_VISION_TRACKER
+    predictiveVisionTracker.reset();
+#endif
   }
 
 #if USE_PREDICTIVE_VISION_TRACKER
-  // 以主控制循环频率连续推进目标角度，避免低帧率造成阶梯式动作。
-  static uint32_t lastVisionControlUs = 0;
-  float visionControlDt = 0.0f;
-  if (lastVisionControlUs != 0) {
-    uint32_t elapsedUs = nowUs - lastVisionControlUs;
-    if (elapsedUs <= 20000U) {
-      visionControlDt = elapsedUs * 1e-6f;
-    }
-  }
-  lastVisionControlUs = nowUs;
-
   bool visionControlActive =
     command_received &&
     visionTrackingValid &&
@@ -425,36 +586,72 @@ void loop() {
       VISION_PID_INTEGRAL_SPEED_LIMIT
     );
 
-  if (visionControlDt > 0.0f) {
-    targetX += visionOutput.speed_x * visionControlDt;
-    targetY += visionOutput.speed_y * visionControlDt;
+  if (visionControlActive) {
+    targetVelocityFeedforwardX = visionOutput.speed_x;
+    targetVelocityFeedforwardY = visionOutput.speed_y;
+  }
 
-    targetX = constrain(targetX, X_ANGLE_MIN, X_ANGLE_MAX);
-    targetY = constrain(targetY, Y_ANGLE_MIN, Y_ANGLE_MAX);
+  if (visionControlActive && highLevelControlDt > 0.0f) {
+    targetX +=
+      targetVelocityFeedforwardX * highLevelControlDt;
+    targetY +=
+      targetVelocityFeedforwardY * highLevelControlDt;
   }
 #endif
 
-  // 电机闭环必须尽可能高频、连续调用。
-  // 即使视觉暂时没有新数据，电机也要继续保持上一次目标角度。
-  // 函数名中 Velocity_Angle 表示库内部采用速度环+角度环串级控制。
-  // 不管有没有数据电机闭环必须持续运行
-  // 非机械零点定位模式下进行
-  if (mechanicalCalibrationMode) {
-    DFOC_X_setTorque(0.0f);
-    DFOC_Y_setTorque(0.0f);
-  }
-  else {
-#if USE_OPTIMIZED_CASCADE
-    DFOC_X_set_Optimized_Velocity_Angle(targetX);
-    DFOC_Y_set_Optimized_Velocity_Angle(targetY);
-#else
-    DFOC_X_set_Velocity_Angle(targetX);
-    DFOC_Y_set_Velocity_Angle(targetY);
-#endif
+  if (
+    autoReturnHomeActive &&
+    !visionTrackingValid &&
+    !mechanicalCalibrationMode &&
+    highLevelControlDt > 0.0f
+  ) {
+    targetX = moveTowardZero(
+      targetX,
+      AUTO_RETURN_HOME_SPEED_X,
+      highLevelControlDt,
+      targetVelocityFeedforwardX
+    );
+    targetY = moveTowardZero(
+      targetY,
+      AUTO_RETURN_HOME_SPEED_Y,
+      highLevelControlDt,
+      targetVelocityFeedforwardY
+    );
+
+    if (targetX == 0.0f && targetY == 0.0f) {
+      autoReturnHomeActive = false;
+    }
   }
 
-  // 电机控制优先完成，再非阻塞检查UDP调参命令。
-  // 调试模式下进行接收命令以及回传电机状态
+  targetX = constrain(targetX, X_ANGLE_MIN, X_ANGLE_MAX);
+  targetY = constrain(targetY, Y_ANGLE_MIN, Y_ANGLE_MAX);
+
+  // 到达机械限位时禁止继续向限位外施加速度前馈。
+  if (
+    (targetX >= X_ANGLE_MAX && targetVelocityFeedforwardX > 0.0f) ||
+    (targetX <= X_ANGLE_MIN && targetVelocityFeedforwardX < 0.0f)
+  ) {
+    targetVelocityFeedforwardX = 0.0f;
+  }
+  if (
+    (targetY >= Y_ANGLE_MAX && targetVelocityFeedforwardY > 0.0f) ||
+    (targetY <= Y_ANGLE_MIN && targetVelocityFeedforwardY < 0.0f)
+  ) {
+    targetVelocityFeedforwardY = 0.0f;
+  }
+
+  publishMotorCommand();
+
+  // 创建固定频率任务失败时，保留一个500Hz的安全回退路径。
+  if (!motorControlTaskStarted) {
+    static uint32_t lastFallbackControlUs = 0;
+    if (nowUs - lastFallbackControlUs >= 2000U) {
+      lastFallbackControlUs = nowUs;
+      runMotorControlOnce();
+    }
+  }
+
+  // 串口解析和WiFi调参留在普通任务，不阻塞固定500Hz电机环。
   if(DebugMode) {
     receiveUdpCommand();
     sendVofaData();
@@ -487,8 +684,12 @@ void sendVofaData() {
   lastSendMs = nowMs;
 
 #if USE_OPTIMIZED_CASCADE
+  if (!lockFoc(pdMS_TO_TICKS(2))) {
+    return;
+  }
   DFOCControlState stateX = DFOC_X_ControlState();
   DFOCControlState stateY = DFOC_Y_ControlState();
+  unlockFoc();
   char packet[256];
   int length = snprintf(
     packet,
@@ -510,10 +711,14 @@ void sendVofaData() {
     visionTrackingValid ? 1.0f : 0.0f      // 视觉帧是否参与追踪
   );
 #else
+  if (!lockFoc(pdMS_TO_TICKS(2))) {
+    return;
+  }
   float angleX = DFOC_X_Angle();
   float angleY = DFOC_Y_Angle();
   float velocityX = DFOC_X_Velocity();
   float velocityY = DFOC_Y_Velocity();
+  unlockFoc();
 
   char packet[160];
   int length = snprintf(
@@ -977,7 +1182,14 @@ void receiveUdpCommand() {
       value <= X_ANGLE_MAX
     ) {
       targetX = value;
+      targetVelocityFeedforwardX = 0.0f;
+      targetVelocityFeedforwardY = 0.0f;
       command_received = false;
+      visionTrackingValid = false;
+      autoReturnHomeActive = false;
+#if USE_PREDICTIVE_VISION_TRACKER
+      predictiveVisionTracker.reset();
+#endif
       updated = true;
     }
   }
@@ -990,7 +1202,14 @@ void receiveUdpCommand() {
       value <= Y_ANGLE_MAX
     ) {
       targetY = value;
+      targetVelocityFeedforwardX = 0.0f;
+      targetVelocityFeedforwardY = 0.0f;
       command_received = false;
+      visionTrackingValid = false;
+      autoReturnHomeActive = false;
+#if USE_PREDICTIVE_VISION_TRACKER
+      predictiveVisionTracker.reset();
+#endif
       updated = true;
     }
   }
@@ -1003,7 +1222,14 @@ void receiveUdpCommand() {
     ) {
       targetX = 0.0f;
       targetY = 0.0f;
+      targetVelocityFeedforwardX = 0.0f;
+      targetVelocityFeedforwardY = 0.0f;
       command_received = false;
+      visionTrackingValid = false;
+      autoReturnHomeActive = false;
+#if USE_PREDICTIVE_VISION_TRACKER
+      predictiveVisionTracker.reset();
+#endif
       updated = true;
     }
   }
@@ -1033,7 +1259,19 @@ void receiveUdpCommand() {
   else if (strcmp(name, "CAL") == 0) {
     if (value == 1.0f) {
       mechanicalCalibrationMode = true;
-      DFOC_RESET_CONTROLLERS();
+      targetVelocityFeedforwardX = 0.0f;
+      targetVelocityFeedforwardY = 0.0f;
+      command_received = false;
+      visionTrackingValid = false;
+      autoReturnHomeActive = false;
+#if USE_PREDICTIVE_VISION_TRACKER
+      predictiveVisionTracker.reset();
+#endif
+      publishMotorCommand();
+      if (lockFoc()) {
+        DFOC_RESET_CONTROLLERS();
+        unlockFoc();
+      }
       updated = true;
     }
   }
@@ -1043,6 +1281,9 @@ void receiveUdpCommand() {
       value == 1.0f &&
       mechanicalCalibrationMode
     ) {
+      if (!lockFoc()) {
+        return;
+      }
       mechanicalZeroX = DFOC_X_RawAngle();
       mechanicalZeroY = DFOC_Y_RawAngle();
       mechanicalZeroValid = true;
@@ -1051,26 +1292,41 @@ void receiveUdpCommand() {
         mechanicalZeroX,
         mechanicalZeroY
       );
+      DFOC_RESET_CONTROLLERS();
+      unlockFoc();
 
       targetX = 0.0f;
       targetY = 0.0f;
+      targetVelocityFeedforwardX = 0.0f;
+      targetVelocityFeedforwardY = 0.0f;
 
       saveParameters();
       mechanicalCalibrationMode = false;
-      DFOC_RESET_CONTROLLERS();
       command_received = false;
+      visionTrackingValid = false;
+      autoReturnHomeActive = false;
+      publishMotorCommand();
       updated = true;
     }
   }
 
   else if (strcmp(name, "CANCEL") == 0) {
     if (value == 1.0f && mechanicalCalibrationMode) {
+      if (!lockFoc()) {
+        return;
+      }
       targetX = DFOC_X_Angle();
       targetY = DFOC_Y_Angle();
+      DFOC_RESET_CONTROLLERS();
+      unlockFoc();
 
       mechanicalCalibrationMode = false;
-      DFOC_RESET_CONTROLLERS();
+      targetVelocityFeedforwardX = 0.0f;
+      targetVelocityFeedforwardY = 0.0f;
       command_received = false;
+      visionTrackingValid = false;
+      autoReturnHomeActive = false;
+      publishMotorCommand();
       updated = true;
     }
   }
@@ -1082,43 +1338,50 @@ void receiveUdpCommand() {
     return;
   }
 
-  // X轴角度参数变化后，把新的Kp、Ki、Kd立即写入DengFOC控制器。
-  // 否则只修改普通变量，正在运行的控制器内部参数可能不会同步。
-  if (xAnglePidUpdated) {
-    DFOC_X_SET_ANGLE_PID(
-      xAngKp,
-      xAngKi,
-      xAngKd,
-      100000
-    );
-  }
+  bool motorPidUpdated =
+    xAnglePidUpdated ||
+    yAnglePidUpdated ||
+    xVelocityPidUpdated ||
+    yVelocityPidUpdated;
 
-  // Y轴角度参数变化后同样立即刷新控制器。
-  if (yAnglePidUpdated) {
-    DFOC_Y_SET_ANGLE_PID(
-      yAngKp,
-      yAngKi,
-      yAngKd,
-      100000
-    );
-  }
+  if (motorPidUpdated && lockFoc()) {
+    // PID对象只在持有FOC互斥锁时更新，避免与500Hz任务并发访问。
+    if (xAnglePidUpdated) {
+      DFOC_X_SET_ANGLE_PID(
+        xAngKp,
+        xAngKi,
+        xAngKd,
+        100000
+      );
+    }
 
-  // 速度环参数变化后立即刷新对应轴的速度PID。
-  if (xVelocityPidUpdated) {
-    DFOC_X_SET_VEL_PID(
-      xSpeedKp,
-      xSpeedKi,
-      xSpeedKd,
-      0
-    );
-  }
+    if (yAnglePidUpdated) {
+      DFOC_Y_SET_ANGLE_PID(
+        yAngKp,
+        yAngKi,
+        yAngKd,
+        100000
+      );
+    }
 
-  if (yVelocityPidUpdated) {
-    DFOC_Y_SET_VEL_PID(
-      ySpeedKp,
-      ySpeedKi,
-      ySpeedKd,
-      0
-    );
+    if (xVelocityPidUpdated) {
+      DFOC_X_SET_VEL_PID(
+        xSpeedKp,
+        xSpeedKi,
+        xSpeedKd,
+        0
+      );
+    }
+
+    if (yVelocityPidUpdated) {
+      DFOC_Y_SET_VEL_PID(
+        ySpeedKp,
+        ySpeedKi,
+        ySpeedKd,
+        0
+      );
+    }
+
+    unlockFoc();
   }
 }

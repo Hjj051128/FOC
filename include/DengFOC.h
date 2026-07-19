@@ -168,6 +168,17 @@ void DFOC_Y_set_Optimized_Velocity_Angle(float Target);
 void DFOC_M0_set_Optimized_Velocity_Angle(float Target);
 void DFOC_M1_set_Optimized_Velocity_Angle(float Target);
 
+// 位置保持 + 目标速度前馈。视觉目标移动时可以立即给出速度，
+// 同时保留角度环来消除位置误差并在目标静止时保持位置。
+void DFOC_X_set_Position_Velocity(
+  float targetAngle,
+  float targetVelocityFeedforward
+);
+void DFOC_Y_set_Position_Velocity(
+  float targetAngle,
+  float targetVelocityFeedforward
+);
+
 // 速度闭环控制。Target单位 rad/s。
 void DFOC_X_setVelocity(float Target);
 void DFOC_Y_setVelocity(float Target);
