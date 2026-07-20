@@ -5,6 +5,7 @@
 #include "WiFi.h"
 #include "WiFiUdp.h"
 #include "ICM42688.h"
+#include "lowpass_filter.h"
 #include <Preferences.h>  // 把参数保存到 ESP32 的非易失性 Flash 中。
 
 // ============================== X轴 PID 默认参数 ==============================
@@ -131,7 +132,18 @@
 #define MECHANICAL_ZERO_MAX  ( 2.0f * PI)
 
 // 陀螺仪测试
-#define IMU_TEST_ONLY 1
+#define IMU_TEST_ONLY 0
+
+// ============================== IMU航向补偿参数 ==============================
+#define USE_IMU_YAW_COMPENSATION       1
+#define IMU_READ_PERIOD_US             2000U  // 500Hz读取ICM42688
+#define IMU_QUIET_BANDWIDTH_HZ         6.0f   // 静止时强滤波
+#define IMU_MOTION_BANDWIDTH_HZ       30.0f   // 转弯时低延迟
+#define IMU_MOTION_THRESHOLD_DPS       3.0f   // 创新量达到此值时进入运动带宽
+#define IMU_MAX_ACCELERATION_DPS2   4000.0f   // 角加速度估计限幅
+#define IMU_YAW_DEAD_ZONE_DPS          0.5f
+#define IMU_YAW_GAIN                   0.3f
+#define IMU_MAX_COMP_SPEED_X           1.0f   // rad/s
 
 bool DebugMode = false;  // 调试模式
 
@@ -206,6 +218,17 @@ ICM42688Sensor imu(
 
 bool imuReady = false;
 bool gyroCalibrated = false;
+AlphaBetaFilter imuGyroZFilter(
+    IMU_QUIET_BANDWIDTH_HZ,
+    IMU_MOTION_BANDWIDTH_HZ,
+    IMU_MOTION_THRESHOLD_DPS,
+    IMU_MAX_ACCELERATION_DPS2
+);
+float imuGyroZRawDps = 0.0f;
+float imuGyroZFilteredDps = 0.0f;
+float imuGyroZAccelerationDps2 = 0.0f;
+float imuYawCompensationX = 0.0f;
+uint32_t lastImuReadUs = 0;
 
 
 // ============================== ESP32热点信息 ==============================
@@ -354,6 +377,71 @@ static float applyVisionSoftDeadZone(float error)
   return copysignf(magnitude - VISION_DEAD_ZONE, error);
 }
 
+static bool initializeImuYaw()
+{
+  imuReady = imu.begin();
+  gyroCalibrated = false;
+  imuYawCompensationX = 0.0f;
+
+  if (!imuReady) {
+    return false;
+  }
+
+  // 零偏校准期间底座必须完全静止。
+  delay(1000);
+  gyroCalibrated = imu.calibrateGyro(1000, 2000);
+  if (!gyroCalibrated || !imu.read()) {
+    return false;
+  }
+
+  imuGyroZRawDps = imu.sample().gyroZ;
+  imuGyroZFilteredDps = imuGyroZRawDps;
+  imuGyroZAccelerationDps2 = 0.0f;
+  imuGyroZFilter.reset(imuGyroZRawDps, 0.0f);
+  lastImuReadUs = micros();
+  return true;
+}
+
+static void updateImuYaw(uint32_t nowUs)
+{
+  if (nowUs - lastImuReadUs < IMU_READ_PERIOD_US) {
+    return;
+  }
+  lastImuReadUs = nowUs;
+
+  if (
+    !imuReady ||
+    !gyroCalibrated ||
+    !imu.read()
+  ) {
+    // 不保留陈旧速度前馈，单次读取失败就安全归零。
+    imuYawCompensationX = 0.0f;
+    return;
+  }
+
+  imuGyroZRawDps = imu.sample().gyroZ;
+  imuGyroZFilteredDps =
+    imuGyroZFilter.update(imuGyroZRawDps);
+  imuGyroZAccelerationDps2 =
+    imuGyroZFilter.derivative();
+
+  float compensatedRateDps = imuGyroZFilteredDps;
+  if (fabsf(compensatedRateDps) < IMU_YAW_DEAD_ZONE_DPS) {
+    compensatedRateDps = 0.0f;
+  }
+
+#if USE_IMU_YAW_COMPENSATION
+  // 实测方向：底座左转gyroZ为正，X正指令让云台右转，所以使用正号。
+  imuYawCompensationX = constrain(
+    IMU_YAW_GAIN * compensatedRateDps * DEG_TO_RAD,
+    -IMU_MAX_COMP_SPEED_X,
+    IMU_MAX_COMP_SPEED_X
+  );
+#else
+  imuYawCompensationX = 0.0f;
+#endif
+}
+
 void setup() {
 
   #if IMU_TEST_ONLY
@@ -366,12 +454,7 @@ void setup() {
       Serial.begin(115200);
       delay(1500);
 
-      imuReady = imu.begin();
-
-      if (imuReady) {
-          delay(1000);
-          gyroCalibrated = imu.calibrateGyro(1000, 2000);
-      }
+      initializeImuYaw();
 
       return;
   #endif
@@ -391,10 +474,16 @@ void setup() {
   preferences.begin("gimbal", false);
   loadParameters();  // 开机时从Flash读取参数
 
-  // 使能电机引脚 
+  // IMU校准期间保持电机关闭，防止对齐动作污染陀螺仪零偏。
   pinMode(EN_X, OUTPUT);
-  digitalWrite(EN_X, HIGH);  
   pinMode(EN_Y, OUTPUT);
+  digitalWrite(EN_X, LOW);
+  digitalWrite(EN_Y, LOW);
+
+  initializeImuYaw();
+
+  // IMU失败时保持视觉控制可用，只是补偿量自动为0。
+  digitalWrite(EN_X, HIGH);
   digitalWrite(EN_Y, HIGH);
 
 
@@ -462,37 +551,37 @@ void setup() {
 
 void loop() {
   #if IMU_TEST_ONLY
-      static uint32_t lastReadUs = 0;
       uint32_t imuNowUs = micros();
+      updateImuYaw(imuNowUs);
 
-      // 每20ms输出一次，也就是50Hz
-      if (imuNowUs - lastReadUs < 20000U) {
+      static uint32_t lastPrintUs = 0;
+      if (imuNowUs - lastPrintUs < 20000U) {
           delay(1);
           return;
       }
-
-      lastReadUs = imuNowUs;
+      lastPrintUs = imuNowUs;
 
       if (!imuReady || !gyroCalibrated) {
           return;
       }
 
-      if (!imu.read()) {
-          return;
-      }
-
       const ICM42688Sample &data = imu.sample();
-      char packet[128];
+      char packet[192];
       int length = snprintf(
           packet,
           sizeof(packet),
-          "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+          "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+          "%.4f,%.4f,%.4f,%.4f\n",
           data.accelX,
           data.accelY,
           data.accelZ,
           data.gyroX,
           data.gyroY,
-          data.gyroZ
+          data.gyroZ,
+          imuGyroZFilteredDps,
+          imuGyroZAccelerationDps2,
+          imuGyroZFilter.activeBandwidthHz(),
+          imuYawCompensationX
       );
 
       if (length > 0 && length < static_cast<int>(sizeof(packet))) {
@@ -508,6 +597,8 @@ void loop() {
 
   // 从UART1读取并校验最新的11字节二进制视觉帧。
   uint32_t nowUs = micros();  // 获取当前时间 us
+  updateImuYaw(nowUs);
+
   unsigned long now = millis();
   static uint32_t lastHighLevelControlUs = 0;
   float highLevelControlDt = 0.0f;
@@ -558,6 +649,10 @@ void loop() {
     // 视觉比例控制：
     float trackSpeedX = visionKx * VISION_DIR_X * visionErrorX;
     float trackSpeedY = visionKy * VISION_DIR_Y * visionErrorY;
+
+    // gyroZ速度前馈与视觉速度相加。补偿同时参与下面的targetX积分，
+    // 避免固定位置目标与惯性补偿互相对抗。
+    trackSpeedX += imuYawCompensationX;
 
     // 速度限幅
     trackSpeedX = constrain(trackSpeedX, -MAX_TRACK_SPEED_X, MAX_TRACK_SPEED_X);
@@ -626,7 +721,11 @@ void loop() {
     );
 
   if (visionControlActive) {
-    targetVelocityFeedforwardX = visionOutput.speed_x;
+    targetVelocityFeedforwardX = constrain(
+      visionOutput.speed_x + imuYawCompensationX,
+      -MAX_TRACK_SPEED_X,
+      MAX_TRACK_SPEED_X
+    );
     targetVelocityFeedforwardY = visionOutput.speed_y;
   }
 
@@ -680,6 +779,7 @@ void loop() {
 // X轴4项：targetAngle, angle, angleError, velocity
 // Y轴4项：targetAngle, angle, angleError, velocity
 // 视觉4项：deltaX, deltaY, confidence, trackingValid
+// IMU 4项：gyroZRaw, gyroZFiltered, gyroZAcceleration, compensationX
 //
 // 原算法模式保持原来的8通道：
 // targetX, angleX, errorX, velocityX,
@@ -711,6 +811,7 @@ void sendVofaData() {
     sizeof(packet),
     "%.4f,%.4f,%.4f,%.4f,"
     "%.4f,%.4f,%.4f,%.4f,"
+    "%.4f,%.4f,%.4f,%.4f,"
     "%.4f,%.4f,%.4f,%.4f\n",
     stateX.target_angle,     // X目标角度
     stateX.angle,            // X现实角度
@@ -723,7 +824,11 @@ void sendVofaData() {
     static_cast<float>(visionDeltaX),      // 视觉X像素误差
     static_cast<float>(visionDeltaY),      // 视觉Y像素误差
     static_cast<float>(visionConfidence),  // 视觉置信度0~100
-    visionTrackingValid ? 1.0f : 0.0f      // 视觉帧是否参与追踪
+    visionTrackingValid ? 1.0f : 0.0f,     // 视觉帧是否参与追踪
+    imuGyroZRawDps,                        // 原始Z角速度deg/s
+    imuGyroZFilteredDps,                   // α-β滤波Z角速度deg/s
+    imuGyroZAccelerationDps2,              // 估计Z角加速度deg/s^2
+    imuYawCompensationX                    // X轴补偿速度rad/s
   );
 #else
   if (!lockFoc(pdMS_TO_TICKS(2))) {
@@ -735,11 +840,13 @@ void sendVofaData() {
   float velocityY = DFOC_Y_Velocity();
   unlockFoc();
 
-  char packet[160];
+  char packet[256];
   int length = snprintf(
     packet,
     sizeof(packet),
-    "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+    "%.4f,%.4f,%.4f,%.4f,"
+    "%.4f,%.4f,%.4f,%.4f,"
+    "%.4f,%.4f,%.4f,%.4f\n",
     targetX,
     angleX,
     targetX - angleX,
@@ -747,7 +854,11 @@ void sendVofaData() {
     targetY,
     angleY,
     targetY - angleY,
-    velocityY
+    velocityY,
+    imuGyroZRawDps,
+    imuGyroZFilteredDps,
+    imuGyroZAccelerationDps2,
+    imuYawCompensationX
   );
 #endif
 
