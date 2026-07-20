@@ -4,8 +4,8 @@
 #include "vision_protocol.h"
 #include "WiFi.h"
 #include "WiFiUdp.h"
+#include "ICM42688.h"
 #include <Preferences.h>  // 把参数保存到 ESP32 的非易失性 Flash 中。
-
 
 // ============================== X轴 PID 默认参数 ==============================
 // ANGKP/ANGKI/ANGKD：X轴角度外环 PID 参数。
@@ -130,6 +130,9 @@
 #define MECHANICAL_ZERO_MIN  (-2.0f * PI)
 #define MECHANICAL_ZERO_MAX  ( 2.0f * PI)
 
+// 陀螺仪测试
+#define IMU_TEST_ONLY 1
+
 bool DebugMode = false;  // 调试模式
 
 // ============================== 可运行时修改的参数变量 ==============================
@@ -191,6 +194,18 @@ float targetVelocityFeedforwardY = 0.0f;
 // 两者共同用于计算相邻两帧之间的时间 dt。
 unsigned long last_command_ms;
 bool command_received = false;
+
+// 创建IMU传感器对象
+ICM42688Sensor imu(
+    SPI,
+    42,  // SCLK
+    41,  // MISO
+    40,  // MOSI
+    39   // CS
+);
+
+bool imuReady = false;
+bool gyroCalibrated = false;
 
 
 // ============================== ESP32热点信息 ==============================
@@ -340,6 +355,26 @@ static float applyVisionSoftDeadZone(float error)
 }
 
 void setup() {
+
+  #if IMU_TEST_ONLY
+      // 测试期间关闭两个电机
+      pinMode(EN_X, OUTPUT);
+      pinMode(EN_Y, OUTPUT);
+      digitalWrite(EN_X, LOW);
+      digitalWrite(EN_Y, LOW);
+
+      Serial.begin(115200);
+      delay(1500);
+
+      imuReady = imu.begin();
+
+      if (imuReady) {
+          delay(1000);
+          gyroCalibrated = imu.calibrateGyro(1000, 2000);
+      }
+
+      return;
+  #endif
   // 读取模式
   pinMode(DEBUG_PIN, INPUT_PULLUP);
   delay(30);  // 按键消抖
@@ -426,6 +461,50 @@ void setup() {
 
 
 void loop() {
+  #if IMU_TEST_ONLY
+      static uint32_t lastReadUs = 0;
+      uint32_t imuNowUs = micros();
+
+      // 每20ms输出一次，也就是50Hz
+      if (imuNowUs - lastReadUs < 20000U) {
+          delay(1);
+          return;
+      }
+
+      lastReadUs = imuNowUs;
+
+      if (!imuReady || !gyroCalibrated) {
+          return;
+      }
+
+      if (!imu.read()) {
+          return;
+      }
+
+      const ICM42688Sample &data = imu.sample();
+      char packet[128];
+      int length = snprintf(
+          packet,
+          sizeof(packet),
+          "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+          data.accelX,
+          data.accelY,
+          data.accelZ,
+          data.gyroX,
+          data.gyroY,
+          data.gyroZ
+      );
+
+      if (length > 0 && length < static_cast<int>(sizeof(packet))) {
+          Serial.write(
+              reinterpret_cast<const uint8_t *>(packet),
+              static_cast<size_t>(length)
+          );
+      }
+
+      return;
+  #endif
+
 
   // 从UART1读取并校验最新的11字节二进制视觉帧。
   uint32_t nowUs = micros();  // 获取当前时间 us
