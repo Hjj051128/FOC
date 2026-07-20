@@ -92,9 +92,9 @@
 #define VISION_KD_Y          0.0f
 #define MAX_TRACK_SPEED_X    1.2f    // x轴跟踪最大速度
 #define MAX_TRACK_SPEED_Y    1.2f    // y轴跟踪最大速度
-#define VISION_DEAD_ZONE     5.0f    // 中心死区像素
+#define VISION_DEAD_ZONE     2.0f    // 中心死区像素
 #define VISION_CONFIDENCE_MIN 40     // 低于该置信度的目标不参与追踪
-#define VISION_LOST_TIMEOUT_MS 150   // 连续无有效目标后进入回中
+#define VISION_LOST_TIMEOUT_MS 150   // 连续无有效目标后锁定当前位置
 #define VISION_DIR_X         1.0     // X轴视觉误差方向
 #define VISION_DIR_Y         1.0     // Y轴视觉误差方向
 
@@ -119,11 +119,6 @@
 #define MOTOR_CONTROL_TASK_STACK         4096
 #define MOTOR_CONTROL_TASK_PRIORITY      3
 #define MOTOR_CONTROL_TASK_CORE          1
-
-// 脱靶后以受限速度平滑回到机械零点，避免直接跳变目标角度。
-#define AUTO_RETURN_HOME_SPEED_X         1.2f
-#define AUTO_RETURN_HOME_SPEED_Y         1.2f
-#define AUTO_RETURN_HOME_EPSILON         0.002f
 
 #define DEBUG_PIN       2   // 上电模式选择引脚，低电平进入WiFi调试模式
 #define DEBUG_LED_PIN   21  // 外接LED：普通模式低电平，WiFi调试模式高电平
@@ -189,7 +184,6 @@ float targetX = 0.0f;
 float targetY = 0.0f;
 float targetVelocityFeedforwardX = 0.0f;
 float targetVelocityFeedforwardY = 0.0f;
-bool autoReturnHomeActive = false;
 
 
 // last_command_ms：上一帧有效视觉数据到达的毫秒时间。
@@ -315,32 +309,6 @@ static void motorControlTask(void *parameter)
     vTaskDelayUntil(&lastWakeTime, periodTicks);
   }
 }
-
-static float moveTowardZero(
-  float value,
-  float speed,
-  float dt,
-  float &velocity
-)
-{
-  if (fabsf(value) <= AUTO_RETURN_HOME_EPSILON) {
-    velocity = 0.0f;
-    return 0.0f;
-  }
-
-  velocity = value > 0.0f
-    ? -speed
-    : speed;
-
-  float maxStep = speed * dt;
-  if (fabsf(value) <= maxStep) {
-    velocity = 0.0f;
-    return 0.0f;
-  }
-
-  return value + velocity * dt;
-}
-
 
 // ============================== 视觉模块串口 ==============================
 // 创建串口对象
@@ -539,27 +507,19 @@ void loop() {
     last_command_ms = now;
     command_received = true;
     visionTrackingValid = true;
-    autoReturnHomeActive = false;
   }
   else if (
     visionTrackingValid &&
     now - last_command_ms >= VISION_LOST_TIMEOUT_MS
   ) {
-    // 单帧低置信度不立即退出；连续超时才进入平滑回中。
+    // 单帧低置信度不立即退出；连续超时后锁定脱靶瞬间的位置。
     command_received = false;
     visionTrackingValid = false;
     targetVelocityFeedforwardX = 0.0f;
     targetVelocityFeedforwardY = 0.0f;
 
-    // 回中轨迹从电机实际位置开始，避免最后视觉目标仍在前方时，
-    // 角度环先与回中速度前馈互相对抗。
-    if (lockFoc(pdMS_TO_TICKS(2))) {
-      targetX = DFOC_X_Angle();
-      targetY = DFOC_Y_Angle();
-      unlockFoc();
-    }
-
-    autoReturnHomeActive = true;
+    // 冻结最后的目标角度，不要改成电机实际角度。Y轴抵抗重力需要
+    // 保留少量位置误差及PID历史；把目标改成实际值会让支撑力矩骤降。
 #if USE_PREDICTIVE_VISION_TRACKER
     predictiveVisionTracker.reset();
 #endif
@@ -598,30 +558,6 @@ void loop() {
       targetVelocityFeedforwardY * highLevelControlDt;
   }
 #endif
-
-  if (
-    autoReturnHomeActive &&
-    !visionTrackingValid &&
-    !mechanicalCalibrationMode &&
-    highLevelControlDt > 0.0f
-  ) {
-    targetX = moveTowardZero(
-      targetX,
-      AUTO_RETURN_HOME_SPEED_X,
-      highLevelControlDt,
-      targetVelocityFeedforwardX
-    );
-    targetY = moveTowardZero(
-      targetY,
-      AUTO_RETURN_HOME_SPEED_Y,
-      highLevelControlDt,
-      targetVelocityFeedforwardY
-    );
-
-    if (targetX == 0.0f && targetY == 0.0f) {
-      autoReturnHomeActive = false;
-    }
-  }
 
   targetX = constrain(targetX, X_ANGLE_MIN, X_ANGLE_MAX);
   targetY = constrain(targetY, Y_ANGLE_MIN, Y_ANGLE_MAX);
@@ -936,10 +872,10 @@ void resetParameters() {
 //
 // 示例：
 // XAP,2.5      修改X轴角度环Kp
-// XAI,0.01     修改X轴角度环Ki
+// XAI,0.02     修改X轴角度环Ki
 // XAD,0.0      修改X轴角度环Kd
-// YAP,2.5      修改Y轴角度环Kp
-// XVP,0.006    修改X轴速度环Kp
+// YAP,7.5      修改Y轴角度环Kp
+// XVP,0.02    修改X轴速度环Kp
 // XVI,0.0      修改X轴速度环Ki
 // XVD,0.0      修改X轴速度环Kd
 // YVP,0.006    修改Y轴速度环Kp
@@ -1186,7 +1122,6 @@ void receiveUdpCommand() {
       targetVelocityFeedforwardY = 0.0f;
       command_received = false;
       visionTrackingValid = false;
-      autoReturnHomeActive = false;
 #if USE_PREDICTIVE_VISION_TRACKER
       predictiveVisionTracker.reset();
 #endif
@@ -1206,7 +1141,6 @@ void receiveUdpCommand() {
       targetVelocityFeedforwardY = 0.0f;
       command_received = false;
       visionTrackingValid = false;
-      autoReturnHomeActive = false;
 #if USE_PREDICTIVE_VISION_TRACKER
       predictiveVisionTracker.reset();
 #endif
@@ -1226,7 +1160,6 @@ void receiveUdpCommand() {
       targetVelocityFeedforwardY = 0.0f;
       command_received = false;
       visionTrackingValid = false;
-      autoReturnHomeActive = false;
 #if USE_PREDICTIVE_VISION_TRACKER
       predictiveVisionTracker.reset();
 #endif
@@ -1263,7 +1196,6 @@ void receiveUdpCommand() {
       targetVelocityFeedforwardY = 0.0f;
       command_received = false;
       visionTrackingValid = false;
-      autoReturnHomeActive = false;
 #if USE_PREDICTIVE_VISION_TRACKER
       predictiveVisionTracker.reset();
 #endif
@@ -1304,7 +1236,6 @@ void receiveUdpCommand() {
       mechanicalCalibrationMode = false;
       command_received = false;
       visionTrackingValid = false;
-      autoReturnHomeActive = false;
       publishMotorCommand();
       updated = true;
     }
@@ -1325,7 +1256,6 @@ void receiveUdpCommand() {
       targetVelocityFeedforwardY = 0.0f;
       command_received = false;
       visionTrackingValid = false;
-      autoReturnHomeActive = false;
       publishMotorCommand();
       updated = true;
     }
