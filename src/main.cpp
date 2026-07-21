@@ -140,8 +140,8 @@
 #define IMU_MOTION_THRESHOLD_DPS       3.0f   // 创新量达到此值时进入运动带宽
 #define IMU_MAX_ACCELERATION_DPS2   4000.0f   // 角加速度估计限幅
 #define IMU_YAW_DEAD_ZONE_DPS          0.5f
-#define IMU_YAW_GAIN                   0.2f
-#define IMU_MAX_COMP_SPEED_X           0.6f   // rad/s，首次上机保守限幅
+#define IMU_YAW_GAIN                   1.0f
+#define IMU_MAX_COMP_SPEED_X           1.0f   // rad/s，首次上机保守限幅
 
 // IMU WiFi调参安全范围。
 #define IMU_YAW_GAIN_MIN              -1.0f
