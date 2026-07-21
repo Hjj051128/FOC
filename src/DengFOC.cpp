@@ -366,7 +366,8 @@ void DFOC_alignSensor(int _PP, int _DIR)
 
 float DFOC_X_RawAngle()
 {
-  return sensor_dir_X * sensorX.getMechanicalAngle();
+  // X轴使用AS5600累计圈数，支持连续多圈旋转。
+  return sensor_dir_X * sensorX.getAngle();
 }
 
 float DFOC_Y_RawAngle()
@@ -392,9 +393,8 @@ void DFOC_CLEAR_MECHANICAL_ZERO()
 float DFOC_X_Angle()
 {
   if (mechanical_zero_enabled) {
-    return normalizeMechanicalAngle(
-      DFOC_X_RawAngle() - mechanical_zero_X
-    );
+    // X轴不能归一化到+/-PI，否则跨圈时位置会突然跳变2PI。
+    return DFOC_X_RawAngle() - mechanical_zero_X;
   }
 
   return sensor_dir_X * sensorX.getAngle();

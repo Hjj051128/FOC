@@ -77,16 +77,14 @@
 
 
 // ============================== 云台机械角度限位 ==============================
-// -1.5 rad 约等于 -85.9°，1.5 rad 约等于 85.9°。
-#define X_ANGLE_MIN  -1.5f
-#define X_ANGLE_MAX  1.5f
-
+// X轴允许连续多圈旋转，不设置位置限幅。
+// Y轴仍限制在约 +/-85.9°，保护俯仰机构。
 #define Y_ANGLE_MIN  -1.5f
 #define Y_ANGLE_MAX  1.5f
 
 // ============================== 视觉追踪参数 ==============================
-#define VISION_KX            0.004f  // x轴像素误差转换到速度的比例
-#define VISION_KY            0.004f  // y轴像素误差转换到速度的比例
+#define VISION_KX            0.002f  // 恢复旧版较柔和的视觉响应
+#define VISION_KY            0.002f
 #define VISION_KI_X          0.0f    // X轴视觉积分，调试时从0开始
 #define VISION_KD_X          0.0f    // X轴视觉微分，调试时从0开始
 #define VISION_KI_Y          0.0f
@@ -121,8 +119,8 @@
 #define MOTOR_CONTROL_TASK_PRIORITY      3
 #define MOTOR_CONTROL_TASK_CORE          1
 
-#define DEBUG_PIN       2   // 上电模式选择引脚，低电平进入WiFi调试模式
-#define DEBUG_LED_PIN   21  // 外接LED：普通模式低电平，WiFi调试模式高电平
+#define DEBUG_PIN       47   // 上电模式选择引脚，低电平进入WiFi调试模式
+#define DEBUG_LED_PIN   38  // 外接LED：普通模式低电平，WiFi调试模式高电平
 
 // 1：使用带实际速度反馈的优化串级环；0：使用原来的控制算法。
 // 这是编译期开关，不会在控制循环中增加运行时判断开销。
@@ -142,8 +140,18 @@
 #define IMU_MOTION_THRESHOLD_DPS       3.0f   // 创新量达到此值时进入运动带宽
 #define IMU_MAX_ACCELERATION_DPS2   4000.0f   // 角加速度估计限幅
 #define IMU_YAW_DEAD_ZONE_DPS          0.5f
-#define IMU_YAW_GAIN                   0.3f
-#define IMU_MAX_COMP_SPEED_X           1.0f   // rad/s
+#define IMU_YAW_GAIN                   0.2f
+#define IMU_MAX_COMP_SPEED_X           0.6f   // rad/s，首次上机保守限幅
+
+// IMU WiFi调参安全范围。
+#define IMU_YAW_GAIN_MIN              -1.0f
+#define IMU_YAW_GAIN_MAX               1.0f
+#define IMU_COMP_LIMIT_MIN             0.0f
+#define IMU_COMP_LIMIT_MAX             2.0f
+#define IMU_DEAD_ZONE_MIN              0.0f
+#define IMU_DEAD_ZONE_MAX             20.0f
+#define IMU_BANDWIDTH_MIN              0.5f
+#define IMU_BANDWIDTH_MAX            100.0f
 
 bool DebugMode = false;  // 调试模式
 
@@ -172,6 +180,13 @@ float visionKiX = VISION_KI_X;
 float visionKdX = VISION_KD_X;
 float visionKiY = VISION_KI_Y;
 float visionKdY = VISION_KD_Y;
+
+// ICM42688航向补偿运行参数，可由VOFA通过WiFi修改。
+float imuYawGain = IMU_YAW_GAIN;
+float imuMaxCompSpeedX = IMU_MAX_COMP_SPEED_X;
+float imuYawDeadZoneDps = IMU_YAW_DEAD_ZONE_DPS;
+float imuQuietBandwidthHz = IMU_QUIET_BANDWIDTH_HZ;
+float imuMotionBandwidthHz = IMU_MOTION_BANDWIDTH_HZ;
 
 // 机械零点
 float mechanicalZeroX = 0.0f;
@@ -426,16 +441,16 @@ static void updateImuYaw(uint32_t nowUs)
     imuGyroZFilter.derivative();
 
   float compensatedRateDps = imuGyroZFilteredDps;
-  if (fabsf(compensatedRateDps) < IMU_YAW_DEAD_ZONE_DPS) {
+  if (fabsf(compensatedRateDps) < imuYawDeadZoneDps) {
     compensatedRateDps = 0.0f;
   }
 
 #if USE_IMU_YAW_COMPENSATION
   // 实测方向：底座左转gyroZ为正，X正指令让云台右转，所以使用正号。
   imuYawCompensationX = constrain(
-    IMU_YAW_GAIN * compensatedRateDps * DEG_TO_RAD,
-    -IMU_MAX_COMP_SPEED_X,
-    IMU_MAX_COMP_SPEED_X
+    imuYawGain * compensatedRateDps * DEG_TO_RAD,
+    -imuMaxCompSpeedX,
+    imuMaxCompSpeedX
   );
 #else
   imuYawCompensationX = 0.0f;
@@ -650,27 +665,27 @@ void loop() {
     float trackSpeedX = visionKx * VISION_DIR_X * visionErrorX;
     float trackSpeedY = visionKy * VISION_DIR_Y * visionErrorY;
 
-    // gyroZ速度前馈与视觉速度相加。补偿同时参与下面的targetX积分，
-    // 避免固定位置目标与惯性补偿互相对抗。
+    // 视觉速度和IMU速度共同生成目标角度轨迹。
     trackSpeedX += imuYawCompensationX;
 
     // 速度限幅
     trackSpeedX = constrain(trackSpeedX, -MAX_TRACK_SPEED_X, MAX_TRACK_SPEED_X);
     trackSpeedY = constrain(trackSpeedY, -MAX_TRACK_SPEED_Y, MAX_TRACK_SPEED_Y);
-    targetVelocityFeedforwardX = trackSpeedX;
-    targetVelocityFeedforwardY = trackSpeedY;
+
+    // 视觉速度不再直接进入电机速度环，避免误差突变造成猛冲。
+    // IMU仍保留直接前馈，用于底座转弯时的低延迟反向补偿。
+    targetVelocityFeedforwardX = constrain(
+      imuYawCompensationX,
+      -imuMaxCompSpeedX,
+      imuMaxCompSpeedX
+    );
+    targetVelocityFeedforwardY = 0.0f;
 
     // 离散积分：
     targetX += trackSpeedX * dt;
     targetY += trackSpeedY * dt;
 
-    // 角度限位
-    targetX = constrain(
-      targetX,
-      X_ANGLE_MIN,
-      X_ANGLE_MAX
-    );
-
+    // X轴允许连续多圈，不做角度限位。
     targetY = constrain(
       targetY,
       Y_ANGLE_MIN,
@@ -721,32 +736,32 @@ void loop() {
     );
 
   if (visionControlActive) {
+    // 电机速度前馈只保留IMU；视觉通过目标角度轨迹进入角度环。
     targetVelocityFeedforwardX = constrain(
+      imuYawCompensationX,
+      -imuMaxCompSpeedX,
+      imuMaxCompSpeedX
+    );
+    targetVelocityFeedforwardY = 0.0f;
+  }
+
+  if (visionControlActive && highLevelControlDt > 0.0f) {
+    float targetTrajectorySpeedX = constrain(
       visionOutput.speed_x + imuYawCompensationX,
       -MAX_TRACK_SPEED_X,
       MAX_TRACK_SPEED_X
     );
-    targetVelocityFeedforwardY = visionOutput.speed_y;
-  }
 
-  if (visionControlActive && highLevelControlDt > 0.0f) {
-    targetX +=
-      targetVelocityFeedforwardX * highLevelControlDt;
+    targetX += targetTrajectorySpeedX * highLevelControlDt;
     targetY +=
-      targetVelocityFeedforwardY * highLevelControlDt;
+      visionOutput.speed_y * highLevelControlDt;
   }
 #endif
 
-  targetX = constrain(targetX, X_ANGLE_MIN, X_ANGLE_MAX);
+  // X轴允许连续多圈，不做目标角度限位。
   targetY = constrain(targetY, Y_ANGLE_MIN, Y_ANGLE_MAX);
 
-  // 到达机械限位时禁止继续向限位外施加速度前馈。
-  if (
-    (targetX >= X_ANGLE_MAX && targetVelocityFeedforwardX > 0.0f) ||
-    (targetX <= X_ANGLE_MIN && targetVelocityFeedforwardX < 0.0f)
-  ) {
-    targetVelocityFeedforwardX = 0.0f;
-  }
+  // Y轴到达机械限位时禁止继续向限位外施加速度前馈。
   if (
     (targetY >= Y_ANGLE_MAX && targetVelocityFeedforwardY > 0.0f) ||
     (targetY <= Y_ANGLE_MIN && targetVelocityFeedforwardY < 0.0f)
@@ -779,7 +794,8 @@ void loop() {
 // X轴4项：targetAngle, angle, angleError, velocity
 // Y轴4项：targetAngle, angle, angleError, velocity
 // 视觉4项：deltaX, deltaY, confidence, trackingValid
-// IMU 4项：gyroZRaw, gyroZFiltered, gyroZAcceleration, compensationX
+// IMU 6项：gyroZRaw, gyroZFiltered, gyroZAcceleration, compensationX,
+//           imuOperational, compensationActuallyApplied
 //
 // 原算法模式保持原来的8通道：
 // targetX, angleX, errorX, velocityX,
@@ -812,7 +828,7 @@ void sendVofaData() {
     "%.4f,%.4f,%.4f,%.4f,"
     "%.4f,%.4f,%.4f,%.4f,"
     "%.4f,%.4f,%.4f,%.4f,"
-    "%.4f,%.4f,%.4f,%.4f\n",
+    "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
     stateX.target_angle,     // X目标角度
     stateX.angle,            // X现实角度
     stateX.angle_error,      // X角度误差
@@ -828,7 +844,9 @@ void sendVofaData() {
     imuGyroZRawDps,                        // 原始Z角速度deg/s
     imuGyroZFilteredDps,                   // α-β滤波Z角速度deg/s
     imuGyroZAccelerationDps2,              // 估计Z角加速度deg/s^2
-    imuYawCompensationX                    // X轴补偿速度rad/s
+    imuYawCompensationX,                   // 算出的X轴补偿速度rad/s
+    (imuReady && gyroCalibrated) ? 1.0f : 0.0f, // 1表示IMU可用
+    targetVelocityFeedforwardX             // 实际送入电机的补偿速度rad/s
   );
 #else
   if (!lockFoc(pdMS_TO_TICKS(2))) {
@@ -975,6 +993,24 @@ void loadParameters() {
     VISION_KD_MAX
   );
 
+  imuYawGain = loadFloatInRange(
+    "iyg", IMU_YAW_GAIN, IMU_YAW_GAIN_MIN, IMU_YAW_GAIN_MAX
+  );
+  imuMaxCompSpeedX = loadFloatInRange(
+    "iml", IMU_MAX_COMP_SPEED_X, IMU_COMP_LIMIT_MIN, IMU_COMP_LIMIT_MAX
+  );
+  imuYawDeadZoneDps = loadFloatInRange(
+    "idz", IMU_YAW_DEAD_ZONE_DPS, IMU_DEAD_ZONE_MIN, IMU_DEAD_ZONE_MAX
+  );
+  imuQuietBandwidthHz = loadFloatInRange(
+    "iqb", IMU_QUIET_BANDWIDTH_HZ, IMU_BANDWIDTH_MIN, IMU_BANDWIDTH_MAX
+  );
+  imuMotionBandwidthHz = loadFloatInRange(
+    "imb", IMU_MOTION_BANDWIDTH_HZ, IMU_BANDWIDTH_MIN, IMU_BANDWIDTH_MAX
+  );
+  imuGyroZFilter.quiet_bandwidth_hz = imuQuietBandwidthHz;
+  imuGyroZFilter.motion_bandwidth_hz = imuMotionBandwidthHz;
+
   mechanicalZeroX = loadFloatInRange(
     "mzx",
     0.0f,
@@ -1019,8 +1055,15 @@ void saveParameters() {
   preferences.putFloat("vdx", visionKdX);
   preferences.putFloat("viy", visionKiY);
   preferences.putFloat("vdy", visionKdY);
+  preferences.putFloat("iyg", imuYawGain);
+  preferences.putFloat("iml", imuMaxCompSpeedX);
+  preferences.putFloat("idz", imuYawDeadZoneDps);
+  preferences.putFloat("iqb", imuQuietBandwidthHz);
+  preferences.putFloat("imb", imuMotionBandwidthHz);
 
-  preferences.putFloat("mzx", mechanicalZeroX);
+  // AS5600断电后无法记住累计圈数。X轴运行时零点可以是多圈角度，
+  // 写入Flash时只保存同方向的单圈余数，重启后仍能恢复正确机械朝向。
+  preferences.putFloat("mzx", fmodf(mechanicalZeroX, 2.0f * PI));
   preferences.putFloat("mzy", mechanicalZeroY);
   preferences.putBool("mzv", mechanicalZeroValid);
 }
@@ -1050,6 +1093,13 @@ void resetParameters() {
   visionKdX = VISION_KD_X;
   visionKiY = VISION_KI_Y;
   visionKdY = VISION_KD_Y;
+  imuYawGain = IMU_YAW_GAIN;
+  imuMaxCompSpeedX = IMU_MAX_COMP_SPEED_X;
+  imuYawDeadZoneDps = IMU_YAW_DEAD_ZONE_DPS;
+  imuQuietBandwidthHz = IMU_QUIET_BANDWIDTH_HZ;
+  imuMotionBandwidthHz = IMU_MOTION_BANDWIDTH_HZ;
+  imuGyroZFilter.quiet_bandwidth_hz = imuQuietBandwidthHz;
+  imuGyroZFilter.motion_bandwidth_hz = imuMotionBandwidthHz;
 
   saveParameters();
 }
@@ -1073,6 +1123,11 @@ void resetParameters() {
 // VXI,0.0      修改X轴视觉I
 // VXD,0.0003   修改X轴视觉D
 // VYP/VYI/VYD  修改Y轴视觉PID
+// IYG,0.20      修改陀螺仪补偿增益
+// IML,0.60      修改最大补偿速度(rad/s)
+// IDZ,0.50      修改Z轴角速度死区(deg/s)
+// IQB,6.0       修改静止滤波带宽(Hz)
+// IMB,30.0      修改运动滤波带宽(Hz)
 // SAVE,1       把当前参数写入Flash
 // RESET,1      恢复默认参数并写入Flash
 //
@@ -1300,12 +1355,53 @@ void receiveUdpCommand() {
     }
   }
 
+  // IYG：gyroZ(deg/s)转换为X轴补偿速度时的比例。
+  // 允许负值，便于传感器安装方向改变时反转补偿方向。
+  else if (strcmp(name, "IYG") == 0) {
+    if (value >= IMU_YAW_GAIN_MIN && value <= IMU_YAW_GAIN_MAX) {
+      imuYawGain = value;
+      updated = true;
+    }
+  }
+
+  // IML：陀螺仪补偿速度的绝对限幅，单位rad/s。
+  else if (strcmp(name, "IML") == 0) {
+    if (value >= IMU_COMP_LIMIT_MIN && value <= IMU_COMP_LIMIT_MAX) {
+      imuMaxCompSpeedX = value;
+      updated = true;
+    }
+  }
+
+  // IDZ：静止附近的gyroZ死区，单位deg/s。
+  else if (strcmp(name, "IDZ") == 0) {
+    if (value >= IMU_DEAD_ZONE_MIN && value <= IMU_DEAD_ZONE_MAX) {
+      imuYawDeadZoneDps = value;
+      updated = true;
+    }
+  }
+
+  // IQB/IMB：alpha-beta滤波器静止/运动带宽，单位Hz。
+  else if (strcmp(name, "IQB") == 0) {
+    if (value >= IMU_BANDWIDTH_MIN && value <= IMU_BANDWIDTH_MAX) {
+      imuQuietBandwidthHz = value;
+      imuGyroZFilter.quiet_bandwidth_hz = value;
+      updated = true;
+    }
+  }
+
+  else if (strcmp(name, "IMB") == 0) {
+    if (value >= IMU_BANDWIDTH_MIN && value <= IMU_BANDWIDTH_MAX) {
+      imuMotionBandwidthHz = value;
+      imuGyroZFilter.motion_bandwidth_hz = value;
+      updated = true;
+    }
+  }
+
   // TX：设置X轴目标角度，单位rad。
   else if (strcmp(name, "TX") == 0) {
     if (
       !mechanicalCalibrationMode &&
-      value >= X_ANGLE_MIN &&
-      value <= X_ANGLE_MAX
+      isfinite(value)
     ) {
       targetX = value;
       targetVelocityFeedforwardX = 0.0f;
