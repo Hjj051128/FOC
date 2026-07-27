@@ -377,7 +377,14 @@ float DFOC_Y_RawAngle()
 
 void DFOC_SET_MECHANICAL_ZERO(float zeroX, float zeroY)
 {
-  mechanical_zero_X = zeroX;
+  // X轴使用累计多圈角度，而Flash中保存的是AS5600单圈机械零点。
+  // 上电电角度对齐可能跨过0/2PI边界，使累计角度临时多出或少一圈。
+  // 把保存零点映射到距离当前累计角度最近的等效圈，既保留连续多圈，
+  // 又避免启动时凭空产生+/-2PI的整圈位置误差。
+  constexpr float TWO_PI_F = 2.0f * PI;
+  float currentX = DFOC_X_RawAngle();
+  float nearestTurn = roundf((currentX - zeroX) / TWO_PI_F);
+  mechanical_zero_X = zeroX + nearestTurn * TWO_PI_F;
   mechanical_zero_Y = zeroY;
   mechanical_zero_enabled = true;
 }

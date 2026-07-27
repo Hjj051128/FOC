@@ -89,7 +89,7 @@
 #define VISION_KD_X          0.0f    // X轴视觉微分，调试时从0开始
 #define VISION_KI_Y          0.0f
 #define VISION_KD_Y          0.0f
-#define MAX_TRACK_SPEED_X    1.2f    // x轴跟踪最大速度
+#define MAX_TRACK_SPEED_X    3.0f    // x轴跟踪最大速度
 #define MAX_TRACK_SPEED_Y    1.2f    // y轴跟踪最大速度
 #define VISION_DEAD_ZONE     2.0f    // 中心死区像素
 #define VISION_CONFIDENCE_MIN 40     // 低于该置信度的目标不参与追踪
@@ -133,21 +133,21 @@
 #define IMU_TEST_ONLY 0
 
 // ============================== IMU航向补偿参数 ==============================
-#define USE_IMU_YAW_COMPENSATION       1
-#define IMU_READ_PERIOD_US             2000U  // 500Hz读取ICM42688
+#define USE_IMU_YAW_COMPENSATION       1      // 总开关
+#define IMU_READ_PERIOD_US             2000U  // 500Hz读取
 #define IMU_QUIET_BANDWIDTH_HZ         6.0f   // 静止时强滤波
-#define IMU_MOTION_BANDWIDTH_HZ       30.0f   // 转弯时低延迟
-#define IMU_MOTION_THRESHOLD_DPS       3.0f   // 创新量达到此值时进入运动带宽
-#define IMU_MAX_ACCELERATION_DPS2   4000.0f   // 角加速度估计限幅
-#define IMU_YAW_DEAD_ZONE_DPS          0.5f
-#define IMU_YAW_GAIN                   1.0f
-#define IMU_MAX_COMP_SPEED_X           1.0f   // rad/s，首次上机保守限幅
+#define IMU_MOTION_BANDWIDTH_HZ       30.0f   // 转弯时延迟 大：补偿更快，噪声大。小：更平滑，补偿慢。
+#define IMU_MOTION_THRESHOLD_DPS       3.0f   // 检测到有明显变化后从静止滤波切换到运动滤波
+#define IMU_MAX_ACCELERATION_DPS2   4000.0f   // 滤波后角加速度估计限幅
+#define IMU_YAW_DEAD_ZONE_DPS          0.5f   // 死区
+#define IMU_YAW_GAIN                   1.5f   // 补偿比例
+#define IMU_MAX_COMP_SPEED_X           3.0f   // 最大补偿速度
 
 // IMU WiFi调参安全范围。
-#define IMU_YAW_GAIN_MIN              -1.0f
-#define IMU_YAW_GAIN_MAX               1.0f
+#define IMU_YAW_GAIN_MIN              -2.0f
+#define IMU_YAW_GAIN_MAX               2.0f
 #define IMU_COMP_LIMIT_MIN             0.0f
-#define IMU_COMP_LIMIT_MAX             2.0f
+#define IMU_COMP_LIMIT_MAX             4.0f
 #define IMU_DEAD_ZONE_MIN              0.0f
 #define IMU_DEAD_ZONE_MAX             20.0f
 #define IMU_BANDWIDTH_MIN              0.5f
