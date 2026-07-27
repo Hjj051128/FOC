@@ -9,3 +9,23 @@ in the development cycle.
 
 More information about PlatformIO Unit Testing:
 - https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+
+// XAP,2.5      修改X轴角度环Kp
+// XAI,0.02     修改X轴角度环Ki
+// XAD,0.0      修改X轴角度环Kd
+// YAP,7.5      修改Y轴角度环Kp
+// XVP,0.02    修改X轴速度环Kp
+// XVI,0.0      修改X轴速度环Ki
+// XVD,0.0      修改X轴速度环Kd
+// YVP,0.006    修改Y轴速度环Kp
+// VXP,0.006    修改X轴视觉P
+// VXI,0.0      修改X轴视觉I
+// VXD,0.0003   修改X轴视觉D
+// VYP/VYI/VYD  修改Y轴视觉PID
+// IYG,0.20      修改陀螺仪补偿增益
+// IML,0.60      修改最大补偿速度(rad/s)
+// IDZ,0.50      修改Z轴角速度死区(deg/s)
+// IQB,6.0       修改静止滤波带宽(Hz)
+// IMB,30.0      修改运动滤波带宽(Hz)
+// SAVE,1       把当前参数写入Flash
+// RESET,1      恢复默认参数并写入Flash
